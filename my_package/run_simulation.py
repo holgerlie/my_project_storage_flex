@@ -13,7 +13,7 @@ Run:
 
 Requirements:
     pip install numpy pandas scipy matplotlib tqdm
-    pip install QuantLib          # optional but recommended
+    pip install QuantLib          # optional but recommended, check usage
 
 Optional — sensitivity analysis:
     python run_simulation.py --greeks
