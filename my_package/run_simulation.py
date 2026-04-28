@@ -27,7 +27,7 @@ from datetime import date
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(__file__))
 
-import config as cfg
+import config_simple as cfg
 from gas_storage_mc import (
     StorageParams,
     MarketParams,

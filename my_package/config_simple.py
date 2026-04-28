@@ -15,7 +15,7 @@ from datetime import date
 
 # ── Simulation ──────────────────────────────────────────────────────────────
 SIMULATION = dict(
-    n_paths        = 10_000,   # number of Monte Carlo paths
+    n_paths        = 2,   # number of Monte Carlo paths
     seed           = 42,       # RNG seed (None = non-deterministic)
     antithetic     = True,     # use antithetic variates for variance reduction
     n_workers      = 4,        # parallel workers (set 1 to disable)
@@ -39,7 +39,7 @@ MARKET = dict(
     spot_price     = 35.00,   # EUR/MWh, current TTF front month
     kappa          = 2.0,     # mean-reversion speed (per year); ~6-month half-life
     theta          = 38.00,   # long-run mean price (EUR/MWh)
-    sigma          = 0.45,    # annual volatility (log-price diffusion)
+    sigma          = 0.001,    # annual volatility (log-price diffusion)
     risk_free_rate = 0.035,   # continuous discount rate (EUR, 3.5%)
 
     # Optional: forward curve override (date -> EUR/MWh).
@@ -72,7 +72,7 @@ STORAGE = dict(
 
     # End-of-contract inventory constraint
     terminal_min_inventory = 0,     # must leave at least this in store
-    terminal_max_inventory = 2_000_000,
+    terminal_max_inventory = 0,
 
     # Injection constraints (MWh/day); rates vary seasonally
     # Format: (month_start, month_end_inclusive) -> max_rate
