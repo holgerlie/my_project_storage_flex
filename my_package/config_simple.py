@@ -40,7 +40,7 @@ MARKET = dict(
     kappa          = 2.0,     # mean-reversion speed (per year); ~6-month half-life
     theta          = 38.00,   # long-run mean price (EUR/MWh)
     sigma          = 0.001,    # annual volatility (log-price diffusion)
-    risk_free_rate = 0.035,   # continuous discount rate (EUR, 3.5%)
+    risk_free_rate = 0.000,   # continuous discount rate (EUR, 3.5%)
 
     # Optional: forward curve override (date -> EUR/MWh).
     # If provided, the OU process is centred on the forward rather than theta.
