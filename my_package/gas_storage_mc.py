@@ -119,6 +119,67 @@ class MarketParams:
 
         t = (d - self._fwd_ref).days
         return float(self._fwd_func(t))
+    
+    def print_forward_curve(
+        self,
+        start: Optional[date] = None,
+        end: Optional[date] = None,
+    ) -> pd.DataFrame:
+        """
+        Return the full daily forward curve as a DataFrame, using the same
+        interpolation logic as forward_price(d).
+
+        Parameters
+        ----------
+        start : date, optional
+            First date of the daily grid. Defaults to the first pillar date
+            in forward_curve (or today if no curve).
+        end : date, optional
+            Last date of the daily grid. Defaults to the last pillar date
+            in forward_curve.
+
+        Returns
+        -------
+        pd.DataFrame with columns:
+            Date          — calendar date
+            Forward_Price — interpolated EUR/MWh price for that date
+            Is_Pillar     — True if the date is an input pillar point
+        """
+        # Determine date range
+        if self.forward_curve is not None:
+            pillars = sorted(self.forward_curve.keys())
+            start = start or pillars[0]
+            end   = end   or pillars[-1]
+        else:
+            # Flat curve — use provided range or a 1-year window from today
+            from datetime import date as date_cls
+            start = start or date_cls.today()
+            end   = end   or (start + timedelta(days=365))
+            pillars = []
+
+        # Build daily grid and evaluate forward_price for each date
+        grid = _build_date_grid(start, end)
+        pillar_set = set(pillars)
+
+        rows = [
+            {
+                "Date":          d,
+                "Forward_Price": round(self.forward_price(d), 4),
+                "Is_Pillar":     d in pillar_set,
+            }
+            for d in grid
+        ]
+
+        df = pd.DataFrame(rows).set_index("Date")
+
+        # Pretty-print to console
+        print(f"{'Date':<14} {'Forward (EUR/MWh)':>18} {'Pillar':>8}")
+        print("-" * 44)
+        for d, row in df.iterrows():
+            marker = " <--" if row["Is_Pillar"] else ""
+            print(f"{str(d):<14} {row['Forward_Price']:>18.4f}{marker}")
+
+        return df
 
 
 @dataclass

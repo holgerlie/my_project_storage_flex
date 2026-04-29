@@ -113,6 +113,7 @@ def main():
     )
 
     t0 = time.perf_counter()
+    daily_fwd_curve = market.print_forward_curve()
     results = simulator.run()
     elapsed = time.perf_counter() - t0
     print(f"Runtime: {elapsed:.1f}s\n")
