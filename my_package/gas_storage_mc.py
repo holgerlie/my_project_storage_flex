@@ -199,7 +199,36 @@ class OptimiserParams:
     withdraw_threshold: float = 42.0
     forward_lookback_days: int = 30
 
+@dataclass
+class IntrinsicResult:
+    """Holds intrinsic valuation output."""
+    npv:       float
+    breakdown: pd.DataFrame
+    date_grid: List[date]
 
+    def summary(self) -> str:
+        inj   = self.breakdown[self.breakdown["Action"] == "Inject"]
+        wit   = self.breakdown[self.breakdown["Action"] == "Withdraw"]
+        idle  = self.breakdown[self.breakdown["Action"] == "Idle"]
+        lines = [
+            "=" * 55,
+            "  Intrinsic Valuation",
+            "=" * 55,
+            f"  NPV                 : EUR {self.npv:>14,.0f}",
+            f"  Injection days      : {len(inj):>14,}",
+            f"  Withdrawal days     : {len(wit):>14,}",
+            f"  Idle days           : {len(idle):>14,}",
+            f"  Total injected MWh  : {inj['Volume_MWh'].sum():>14,.0f}",
+            f"  Total withdrawn MWh : {abs(wit['Volume_MWh'].sum()):>14,.0f}",
+            "=" * 55,
+        ]
+        return "\n".join(lines)
+
+    def save_csv(self, path: str = "intrinsic_dispatch.csv") -> str:
+        self.breakdown.to_csv(path)
+        print(f"Intrinsic dispatch schedule saved → {path}")
+        return path
+    
 # ════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ════════════════════════════════════════════════════════════════════════════
@@ -544,6 +573,13 @@ class GasStorageSimulator:
         self.date_grid = _build_date_grid(start, end)
 
     def run(self) -> "SimulationResults":
+        
+        print("Computing intrinsic value...")
+        intrinsic = IntrinsicValuator(
+            self.storage, self.market, self.date_grid
+        ).run()
+        print(f"Intrinsic NPV: EUR {intrinsic.npv:,.0f}")
+    
         """Execute Monte Carlo simulation and return results."""
         print(f"Simulating {self.sim.n_paths:,} paths over "
               f"{len(self.date_grid)} days...")
@@ -581,6 +617,7 @@ class GasStorageSimulator:
             sample_inventories=np.array(sample_inventories),
             market=self.market,
             sim_params=self.sim,
+            intrinsic_result=intrinsic,
         )
 
     # ── Sensitivity / Greek-style analysis ──────────────────────────────────
@@ -639,6 +676,7 @@ class SimulationResults:
         sample_inventories: np.ndarray,
         market: MarketParams,
         sim_params: SimulationParams,
+        intrinsic_result: IntrinsicResult = None
     ):
         self.npvs = npvs
         self.date_grid = date_grid
@@ -646,6 +684,7 @@ class SimulationResults:
         self.sample_inventories = sample_inventories
         self.market = market
         self.sim_params = sim_params
+        self.intrinsic_result = intrinsic_result
 
     @property
     def mean_npv(self) -> float:
@@ -681,6 +720,23 @@ class SimulationResults:
         for p in pcts:
             lines.append(f"    P{p:<3d}            : EUR {self.percentile(p):>14,.0f}")
         lines.append("=" * 55)
+        
+        if self.intrinsic_result is not None:
+            iv  = self.intrinsic_result.npv
+            ev  = self.mean_npv - iv
+            pct = ev / iv * 100 if iv != 0 else float('nan')
+            lines += [
+                "",
+
+            "  Value Decomposition:",
+            "-" * 55,
+            f"  Intrinsic value     : EUR {iv:>14,.0f}",
+            f"  Extrinsic value     : EUR {ev:>14,.0f}",
+            f"  Total (MC mean)     : EUR {self.mean_npv:>14,.0f}",
+            f"  Extrinsic / Intrin. : {pct:>13.1f}%",
+            "=" * 55,
+        ]
+        
         return "\n".join(lines)
 
     def to_dataframe(self) -> pd.DataFrame:
@@ -825,3 +881,208 @@ class SimulationResults:
         df.to_csv(save_path)
         print(f"Sample inventory saved → {save_path}")
         return save_path
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Intrinsic Evaluation
+# ════════════════════════════════════════════════════════════════════════════
+
+class IntrinsicValuator:
+    """
+    Computes the intrinsic value of a gas storage facility.
+
+    The intrinsic value is the NPV achievable by optimally
+    dispatching against the known forward curve today, with
+    no uncertainty. It is computed as a single deterministic
+    dispatch run — no simulation required.
+
+    This is the lower bound of total storage value. The gap
+    between the Monte Carlo mean NPV and the intrinsic value
+    is the extrinsic (time) value of the storage optionality.
+
+    Parameters
+    ----------
+    storage   : StorageParams
+    market    : MarketParams  — forward_curve and risk_free_rate used
+    date_grid : list of date
+    """
+
+    def __init__(
+        self,
+        storage:   StorageParams,
+        market:    MarketParams,
+        date_grid: List[date],
+    ):
+        self.storage   = storage
+        self.market    = market
+        self.date_grid = date_grid
+
+    def run(self) -> "IntrinsicResult":
+        """
+        Execute the intrinsic valuation.
+
+        Steps
+        -----
+        1. Build the daily forward price array from market.forward_price(d)
+        2. Run greedy optimal dispatch over that deterministic price path
+           using the same StorageDispatcher logic (rolling intrinsic mode
+           with zero dead-band — act on any positive spread)
+        3. Compute NPV using compute_path_npv
+        4. Return IntrinsicResult with full breakdown
+
+        Returns
+        -------
+        IntrinsicResult
+        """
+        # Step 1 — build deterministic forward price path
+        fwd_prices = np.array([
+            self.market.forward_price(d) for d in self.date_grid
+        ])
+
+        # Step 2 — dispatch against forward curve
+        # Use a zero dead-band so every positive spread triggers action
+        inventory, net_volume, terminal_penalty = self._dispatch(fwd_prices)
+
+        # Step 3 — compute NPV
+        npv = compute_path_npv(
+            fwd_prices, net_volume, inventory,
+            terminal_penalty, self.date_grid,
+            self.storage, self.market,
+        )
+
+        # Step 4 — build daily breakdown DataFrame
+        breakdown = self._build_breakdown(
+            fwd_prices, net_volume, inventory
+        )
+
+        return IntrinsicResult(
+            npv       = npv,
+            breakdown = breakdown,
+            date_grid = self.date_grid,
+        )
+
+    def _dispatch(
+        self,
+        prices: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Greedy forward-pass dispatch against a deterministic price path.
+
+        Decision rule — rolling intrinsic with zero dead-band:
+          Compare today's forward price to the average forward
+          over the next `forward_lookback_days` days.
+          Inject if today < forward average (buy cheap).
+          Withdraw if today > forward average (sell dear).
+
+        This is identical to StorageDispatcher._decide() in
+        rolling_intrinsic mode with dead_band = 0, applied to
+        the deterministic forward curve rather than a simulated path.
+        """
+        n         = len(prices)
+        inventory = np.zeros(n)
+        inventory[0] = self.storage.initial_inventory
+        net_volume   = np.zeros(n)
+        lookback     = 30   # days forward to average for reference price
+
+        for i in range(n - 1):
+            d     = self.date_grid[i]
+            month = d.month
+            inv   = inventory[i]
+            spot  = prices[i]
+
+            max_inj = self.storage.max_injection_rate(month)
+            max_wit = self.storage.max_withdrawal_rate(month)
+
+            room_to_fill  = self.storage.max_inventory - inv
+            room_to_empty = inv - self.storage.min_inventory
+
+            inj_cap = min(max_inj, room_to_fill)
+            wit_cap = min(max_wit, room_to_empty)
+
+            # Forward reference — average of known forward prices
+            # over the next `lookback` days
+            fwd_slice = [
+                self.market.forward_price(d + timedelta(days=j))
+                for j in range(1, lookback + 1)
+            ]
+            fwd_ref = np.mean(fwd_slice)
+            spread  = fwd_ref - spot
+
+            if spread > 0 and inj_cap > 0:
+                vol = inj_cap
+                net_volume[i]    = vol
+                inventory[i + 1] = inv + vol * self.storage.injection_efficiency
+            elif spread < 0 and wit_cap > 0:
+                vol = -wit_cap
+                net_volume[i]    = vol
+                inventory[i + 1] = inv + vol
+            else:
+                net_volume[i]    = 0.0
+                inventory[i + 1] = inv
+
+            inventory[i + 1] = np.clip(
+                inventory[i + 1],
+                self.storage.min_inventory,
+                self.storage.max_inventory,
+            )
+
+        # Terminal penalty
+        terminal_inventory = inventory[-1]
+        terminal_penalty   = 0.0
+        if terminal_inventory < self.storage.terminal_min_inventory:
+            terminal_penalty = (
+                (self.storage.terminal_min_inventory - terminal_inventory)
+                * prices[-1] * 5.0
+            )
+
+        return inventory, net_volume, terminal_penalty
+
+    def _build_breakdown(
+        self,
+        prices:     np.ndarray,
+        net_volume: np.ndarray,
+        inventory:  np.ndarray,
+    ) -> pd.DataFrame:
+        """
+        Build a daily breakdown DataFrame showing the full
+        dispatch schedule implied by the intrinsic valuation.
+
+        Columns
+        -------
+        Date         — calendar date
+        Forward      — EUR/MWh forward price
+        Action       — Inject / Withdraw / Idle
+        Volume_MWh   — volume injected (+) or withdrawn (-)
+        Inventory    — end-of-day inventory level (MWh)
+        Daily_CF_EUR — undiscounted daily cash flow
+        """
+        rows = []
+        t0   = self.date_grid[0]
+
+        for i, d in enumerate(self.date_grid[:-1]):
+            vol  = net_volume[i]
+            spot = prices[i]
+
+            if vol > 0:
+                action   = "Inject"
+                daily_cf = -(spot * vol + self.storage.injection_cost_per_mwh * vol)
+            elif vol < 0:
+                action   = "Withdraw"
+                sold_vol = abs(vol) * self.storage.withdrawal_efficiency
+                daily_cf = spot * sold_vol - self.storage.withdrawal_cost_per_mwh * abs(vol)
+            else:
+                action   = "Idle"
+                daily_cf = 0.0
+
+            daily_cf -= self.storage.daily_fixed_cost
+
+            rows.append({
+                "Date":        d,
+                "Forward":     round(spot, 4),
+                "Action":      action,
+                "Volume_MWh":  round(vol, 1),
+                "Inventory":   round(inventory[i + 1], 1),
+                "Daily_CF_EUR": round(daily_cf, 2),
+            })
+
+        return pd.DataFrame(rows).set_index("Date")
