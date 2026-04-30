@@ -15,7 +15,7 @@ from datetime import date
 
 # ── Simulation ──────────────────────────────────────────────────────────────
 SIMULATION = dict(
-    n_paths        = 2,   # number of Monte Carlo paths
+    n_paths        = 20,   # number of Monte Carlo paths
     seed           = 42,       # RNG seed (None = non-deterministic)
     antithetic     = True,     # use antithetic variates for variance reduction
     n_workers      = 4,        # parallel workers (set 1 to disable)
@@ -37,7 +37,7 @@ CALENDAR = dict(
 # We implement the lognormal variant (log-prices follow OU) to avoid negatives.
 MARKET = dict(
     spot_price     = 35.00,   # EUR/MWh, current TTF front month
-    kappa          = 2.0,     # mean-reversion speed (per year); ~6-month half-life
+    kappa          = 10.0,     # mean-reversion speed (per year); ~6-month half-life
     theta          = 38.00,   # long-run mean price (EUR/MWh)
     sigma          = 0.001,    # annual volatility (log-price diffusion)
     risk_free_rate = 0.000,   # continuous discount rate (EUR, 3.5%)
