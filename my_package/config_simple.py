@@ -15,7 +15,7 @@ from datetime import date
 
 # ── Simulation ──────────────────────────────────────────────────────────────
 SIMULATION = dict(
-    n_paths        = 20,   # number of Monte Carlo paths
+    n_paths        = 10_000,   # number of Monte Carlo paths
     seed           = 42,       # RNG seed (None = non-deterministic)
     antithetic     = True,     # use antithetic variates for variance reduction
     n_workers      = 4,        # parallel workers (set 1 to disable)

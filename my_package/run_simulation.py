@@ -13,7 +13,7 @@ Run:
 
 Requirements:
     pip install numpy pandas scipy matplotlib tqdm
-    pip install QuantLib          # optional but recommended, check usage
+    pip install QuantLib          # optional but recommended
 
 Optional — sensitivity analysis:
     python run_simulation.py --greeks
@@ -27,7 +27,7 @@ from datetime import date
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(__file__))
 
-import config as cfg
+import config_simple as cfg
 from gas_storage_mc import (
     StorageParams,
     MarketParams,
@@ -145,6 +145,13 @@ def main():
         inv_csv   = os.path.join(out_dir, "sample_inventory.csv")
         results.save_sample_paths_csv(paths_csv)
         results.save_inventory_csv(inv_csv)
+
+    # ── Save intrinsic dispatch schedule ──────────────────────────────
+    if results.intrinsic_result is not None:
+        intrinsic_csv = os.path.join(out_dir, "intrinsic_dispatch.csv")
+        results.intrinsic_result.save_csv(intrinsic_csv)
+        print()
+        print(results.intrinsic_result.summary())
 
     # ── Optional Greeks ────────────────────────────────────────────────────
     if run_greeks:
