@@ -111,6 +111,11 @@ OPTIMISER = dict(
     # Rolling intrinsic: compare spot vs. average forward over remaining horizon
     # Uses the forward_curve from MARKET; falls back to theta if not set.
     forward_lookback_days = 30,   # how many days ahead to average for forward reference
+    
+    # Minimum spread (EUR/MWh) required to trigger inject/withdraw action.
+    # Suppresses noise-driven churn on stochastic MC paths.
+    # IntrinsicValuator always overrides this to 0.0 internally.
+    dead_band = 0.20,
 )
 
 # ── Output ───────────────────────────────────────────────────────────────────

@@ -84,15 +84,23 @@ class StorageParams:
 
 @dataclass
 class MarketParams:
-    """Market and price-process parameters."""
-    spot_price: float
-    kappa: float
-    theta: float
-    sigma: float
-    risk_free_rate: float
-    forward_curve: Optional[Dict[date, float]] = None
+    """
+    Market and price-process parameters.
+    All values must be supplied explicitly — config.py is the single source of truth.
 
-    # Interpolated forward function (built lazily)
+    forward_curve : Optional[Dict[date, float]]
+        Monthly TTF forward pillars {date: EUR/MWh}. Pass None to use flat theta.
+        Kept Optional here because None is a legitimate runtime value, not a default.
+    """
+    spot_price    : float
+    kappa         : float
+    theta         : float
+    sigma         : float
+    risk_free_rate: float
+    forward_curve : Optional[Dict[date, float]]
+
+    # Internal lazy-initialisation fields — not user-facing parameters.
+    # field(init=False) means they are excluded from __init__ and unpacking.
     _fwd_func: Optional[object] = field(default=None, init=False, repr=False)
 
     def forward_price(self, d: date) -> float:
@@ -184,20 +192,33 @@ class MarketParams:
 
 @dataclass
 class SimulationParams:
-    """Monte Carlo simulation settings."""
-    n_paths: int = 10_000
-    seed: Optional[int] = 42
-    antithetic: bool = True
-    n_workers: int = 1
+    """
+    Monte Carlo simulation settings.
+    All values must be supplied explicitly — config.py is the single source of truth.
+    """
+    n_paths   : int
+    seed      : Optional[int]
+    antithetic: bool
+    n_workers : int
 
 
 @dataclass
 class OptimiserParams:
-    """Dispatch optimiser settings."""
-    strategy: str = "rolling_intrinsic"   # "threshold" or "rolling_intrinsic"
-    inject_threshold: float = 33.0
-    withdraw_threshold: float = 42.0
-    forward_lookback_days: int = 30
+    """
+    Dispatch optimiser settings.
+    All values must be supplied explicitly — config.py is the single source of truth.
+
+    dead_band : float
+        Minimum spread (EUR/MWh) required to trigger inject/withdraw in
+        rolling_intrinsic mode. MC dispatcher uses 0.20 to suppress
+        noise-driven churn on stochastic paths. IntrinsicValuator
+        constructs a local instance with dead_band=0.0.
+    """
+    strategy             : str
+    inject_threshold     : float
+    withdraw_threshold   : float
+    forward_lookback_days: int
+    dead_band            : float
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -427,8 +448,7 @@ class StorageDispatcher:
     def _decide(self, spot: float, step: int, inventory: float) -> str:
         """Return 'inject', 'withdraw', or 'idle'."""
         strategy = self.opt.strategy
-        storage = self.storage
-        fwd_ref = self._fwd_ref[step]
+        fwd_ref  = self._fwd_ref[step]
 
         if strategy == "threshold":
             if spot < self.opt.inject_threshold:
@@ -439,9 +459,9 @@ class StorageDispatcher:
 
         elif strategy == "rolling_intrinsic":
             spread = fwd_ref - spot
-            # Inject if current price is cheaper than forward reference
-            # Use a small dead-band to avoid churning
-            dead_band = 0.20   # EUR/MWh
+            # CHANGE 2: dead_band now read from OptimiserParams instead of
+            # being hardcoded. MC paths use 0.20 EUR/MWh; intrinsic uses 0.0.
+            dead_band = self.opt.dead_band
             if spread > dead_band:
                 return "inject"
             elif spread < -dead_band:
@@ -570,7 +590,9 @@ class IntrinsicValuator:
     date_grid : list of date
     """
 
-    # Rolling lookback window for the forward reference price (days)
+    # CHANGE 4: _LOOKBACK kept here as the single source of truth for the
+    # lookback window — passed into OptimiserParams inside run() rather than
+    # used by a local _build_fwd_reference(). Eliminates the duplicate.
     _LOOKBACK = 30
 
     def __init__(
@@ -587,11 +609,18 @@ class IntrinsicValuator:
         """
         Execute the intrinsic valuation.
 
+        CHANGE 3: _dispatch() and its _build_fwd_reference() are deleted.
+        StorageDispatcher is now the single dispatch engine for both
+        deterministic (intrinsic) and stochastic (MC) paths.
+        A zero dead_band OptimiserParams is passed so every non-zero
+        spread triggers injection or withdrawal — appropriate for a
+        known deterministic forward curve with no noise to filter.
+
         Steps
         -----
         1. Build the daily forward price array from market.forward_price(d)
-        2. Pre-compute rolling forward reference (same logic as StorageDispatcher)
-        3. Greedy dispatch with zero dead-band — act on any non-zero spread
+        2. Construct StorageDispatcher with dead_band=0.0
+        3. Call dispatcher.dispatch_path(fwd_prices) — shared dispatch logic
         4. Compute discounted NPV via compute_path_npv
         5. Build daily breakdown DataFrame
 
@@ -604,13 +633,24 @@ class IntrinsicValuator:
             [self.market.forward_price(d) for d in self.date_grid]
         )
 
-        # Step 2 — rolling forward reference (average fwd over next 30 days)
-        fwd_ref = self._build_fwd_reference()
-
-        # Step 3 — dispatch
-        inventory, net_volume, terminal_penalty = self._dispatch(
-            fwd_prices, fwd_ref
+        # Step 2 — build dispatcher with zero dead_band
+        # CHANGE 3: replaces the former self._dispatch() / self._build_fwd_reference().
+        # All fields required (no defaults) so inject_threshold and
+        # withdraw_threshold are supplied even though they are unused in
+        # rolling_intrinsic mode — they are required by the dataclass.
+        intrinsic_opt = OptimiserParams(
+            strategy              = "rolling_intrinsic",
+            inject_threshold      = 0.0,   # unused in rolling_intrinsic mode
+            withdraw_threshold    = 0.0,   # unused in rolling_intrinsic mode
+            forward_lookback_days = self._LOOKBACK,
+            dead_band             = 0.0,   # deterministic curve — no noise to filter
         )
+        dispatcher = StorageDispatcher(
+            self.storage, self.market, intrinsic_opt, self.date_grid
+        )
+
+        # Step 3 — shared dispatch logic
+        inventory, net_volume, terminal_penalty = dispatcher.dispatch_path(fwd_prices)
 
         # Step 4 — NPV
         npv = compute_path_npv(
@@ -623,93 +663,6 @@ class IntrinsicValuator:
         breakdown = self._build_breakdown(fwd_prices, net_volume, inventory)
 
         return IntrinsicResult(npv=npv, breakdown=breakdown, date_grid=self.date_grid)
-
-    def _build_fwd_reference(self) -> np.ndarray:
-        """
-        Pre-compute the rolling forward reference for every date in the grid.
-        Mirrors StorageDispatcher._build_fwd_reference() exactly so the
-        intrinsic dispatch uses the same decision signal as the MC dispatcher.
-        """
-        lb   = self._LOOKBACK
-        refs = np.zeros(len(self.date_grid))
-        for i, d in enumerate(self.date_grid):
-            fwd_slice = [
-                self.market.forward_price(d + timedelta(days=j))
-                for j in range(1, lb + 1)
-            ]
-            refs[i] = np.mean(fwd_slice)
-        return refs
-
-    def _dispatch(
-        self,
-        prices:  np.ndarray,
-        fwd_ref: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        """
-        Greedy deterministic dispatch over the forward curve.
-
-        Decision rule — rolling intrinsic with zero dead-band:
-          Inject   if fwd_ref[i] > prices[i]  (forward above spot — buy cheap)
-          Withdraw if fwd_ref[i] < prices[i]  (forward below spot — sell dear)
-          Idle     otherwise
-
-        Zero dead-band (vs 0.20 EUR/MWh in the MC dispatcher) is appropriate
-        here because we are optimising against a known deterministic curve —
-        there is no noise to filter out.
-        """
-        n         = len(prices)
-        inventory = np.zeros(n)
-        inventory[0] = self.storage.initial_inventory
-        net_volume   = np.zeros(n)
-
-        for i in range(n - 1):
-            d     = self.date_grid[i]
-            month = d.month
-            inv   = inventory[i]
-            spot  = prices[i]
-
-            max_inj = self.storage.max_injection_rate(month)
-            max_wit = self.storage.max_withdrawal_rate(month)
-
-            room_to_fill  = self.storage.max_inventory - inv
-            room_to_empty = inv - self.storage.min_inventory
-
-            inj_cap = min(max_inj, room_to_fill)
-            wit_cap = min(max_wit, room_to_empty)
-
-            spread = fwd_ref[i] - spot   # positive → inject, negative → withdraw
-
-            if spread > 0 and inj_cap > 0:
-                net_volume[i]    = inj_cap
-                inventory[i + 1] = inv + inj_cap * self.storage.injection_efficiency
-            elif spread < 0 and wit_cap > 0:
-                net_volume[i]    = -wit_cap
-                inventory[i + 1] = inv - wit_cap
-            else:
-                net_volume[i]    = 0.0
-                inventory[i + 1] = inv
-
-            inventory[i + 1] = np.clip(
-                inventory[i + 1],
-                self.storage.min_inventory,
-                self.storage.max_inventory,
-            )
-
-        # Terminal penalty
-        terminal_inventory = inventory[-1]
-        terminal_penalty   = 0.0
-        if terminal_inventory < self.storage.terminal_min_inventory:
-            terminal_penalty = (
-                (self.storage.terminal_min_inventory - terminal_inventory)
-                * prices[-1] * 5.0
-            )
-        if terminal_inventory > self.storage.terminal_max_inventory:
-            terminal_penalty += (
-                (terminal_inventory - self.storage.terminal_max_inventory)
-                * prices[-1] * 5.0
-            )
-
-        return inventory, net_volume, terminal_penalty
 
     def _build_breakdown(
         self,

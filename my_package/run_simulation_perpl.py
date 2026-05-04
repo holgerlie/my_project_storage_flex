@@ -38,51 +38,30 @@ from gas_storage_mc import (
 
 
 # ── Build parameter objects from config ────────────────────────────────────
+# Each dataclass is constructed by unpacking its config dict directly.
+# config.py is the single source of truth for all parameter values.
+# Adding a new parameter only requires updating config.py and the dataclass
+# field definition — run_simulation.py needs no changes.
+#
+# StorageParams: rate schedule dicts use tuple keys in the dataclass but
+# list keys in config.py (JSON-serialisable), so a one-off conversion is
+# still needed for those two fields.
 
 def build_params():
-    storage = StorageParams(
-        min_inventory=cfg.STORAGE["min_inventory"],
-        max_inventory=cfg.STORAGE["max_inventory"],
-        initial_inventory=cfg.STORAGE["initial_inventory"],
-        terminal_min_inventory=cfg.STORAGE["terminal_min_inventory"],
-        terminal_max_inventory=cfg.STORAGE["terminal_max_inventory"],
-        injection_rate_schedule={
-            tuple(k): v
-            for k, v in cfg.STORAGE["injection_rate_schedule"].items()
-        },
-        withdrawal_rate_schedule={
-            tuple(k): v
-            for k, v in cfg.STORAGE["withdrawal_rate_schedule"].items()
-        },
-        injection_efficiency=cfg.STORAGE["injection_efficiency"],
-        withdrawal_efficiency=cfg.STORAGE["withdrawal_efficiency"],
-        injection_cost_per_mwh=cfg.STORAGE["injection_cost_per_mwh"],
-        withdrawal_cost_per_mwh=cfg.STORAGE["withdrawal_cost_per_mwh"],
-        daily_fixed_cost=cfg.STORAGE["daily_fixed_cost"],
-    )
+    # StorageParams — convert rate schedule keys from list to tuple
+    storage_cfg = dict(cfg.STORAGE)
+    storage_cfg["injection_rate_schedule"] = {
+        tuple(k): v for k, v in cfg.STORAGE["injection_rate_schedule"].items()
+    }
+    storage_cfg["withdrawal_rate_schedule"] = {
+        tuple(k): v for k, v in cfg.STORAGE["withdrawal_rate_schedule"].items()
+    }
+    storage = StorageParams(**storage_cfg)
 
-    market = MarketParams(
-        spot_price=cfg.MARKET["spot_price"],
-        kappa=cfg.MARKET["kappa"],
-        theta=cfg.MARKET["theta"],
-        sigma=cfg.MARKET["sigma"],
-        risk_free_rate=cfg.MARKET["risk_free_rate"],
-        forward_curve=cfg.MARKET["forward_curve"],
-    )
-
-    sim_params = SimulationParams(
-        n_paths=cfg.SIMULATION["n_paths"],
-        seed=cfg.SIMULATION["seed"],
-        antithetic=cfg.SIMULATION["antithetic"],
-        n_workers=cfg.SIMULATION["n_workers"],
-    )
-
-    opt_params = OptimiserParams(
-        strategy=cfg.OPTIMISER["strategy"],
-        inject_threshold=cfg.OPTIMISER["inject_threshold"],
-        withdraw_threshold=cfg.OPTIMISER["withdraw_threshold"],
-        forward_lookback_days=cfg.OPTIMISER["forward_lookback_days"],
-    )
+    # MarketParams, SimulationParams, OptimiserParams — direct unpacking
+    market     = MarketParams(**cfg.MARKET)
+    sim_params = SimulationParams(**cfg.SIMULATION)
+    opt_params = OptimiserParams(**cfg.OPTIMISER)
 
     start = cfg.CALENDAR["start_date"]
     end   = cfg.CALENDAR["end_date"]
