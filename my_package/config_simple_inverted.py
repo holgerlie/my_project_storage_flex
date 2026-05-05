@@ -15,7 +15,7 @@ from datetime import date
 
 # ── Simulation ──────────────────────────────────────────────────────────────
 SIMULATION = dict(
-    n_paths        = 1_000,   # number of Monte Carlo paths
+    n_paths        = 10_000,   # number of Monte Carlo paths
     seed           = 42,       # RNG seed (None = non-deterministic)
     antithetic     = True,     # use antithetic variates for variance reduction
     n_workers      = 4,        # parallel workers (set 1 to disable)
@@ -24,8 +24,8 @@ SIMULATION = dict(
 # ── Calendar / Dates ─────────────────────────────────────────────────────────
 CALENDAR = dict(
     valuation_date = date(2026, 4, 17),   # today (pricing date)
-    start_date     = date(2026, 6, 1),   # storage contract start
-    end_date       = date(2026, 12, 1),   # storage contract end (1 gas year)
+    start_date     = date(2026, 4, 17),   # storage contract start
+    end_date       = date(2027, 4, 17),   # storage contract end (1 gas year)
 )
 
 # ── Market Parameters ────────────────────────────────────────────────────────
@@ -46,18 +46,18 @@ MARKET = dict(
     # If provided, the OU process is centred on the forward rather than theta.
     # Set to None to use flat theta.
     forward_curve  = {
-        date(2026,  5,  1): 35.00,
-        date(2026,  6,  1): 35.00,
-        date(2026,  7,  1): 35.00,
-        date(2026,  8,  1): 35.00,
-        date(2026,  9,  1): 35.00,
-        date(2026, 10,  1): 40.00,
-        date(2026, 11,  1): 40.00,
-        date(2026, 12,  1): 40.00,
-        date(2027,  1,  1): 40.00,
-        date(2027,  2,  1): 40.00,
-        date(2027,  3,  1): 40.00,
-        date(2027,  4,  1): 40.00,
+        date(2026,  5,  1): 40.00,
+        date(2026,  6,  1): 40.00,
+        date(2026,  7,  1): 40.00,
+        date(2026,  8,  1): 40.00,
+        date(2026,  9,  1): 40.00,
+        date(2026, 10,  1): 35.00,
+        date(2026, 11,  1): 35.00,
+        date(2026, 12,  1): 35.00,
+        date(2027,  1,  1): 35.00,
+        date(2027,  2,  1): 35.00,
+        date(2027,  3,  1): 35.00,
+        date(2027,  4,  1): 35.00,
     },
 )
 

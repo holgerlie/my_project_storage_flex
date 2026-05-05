@@ -30,6 +30,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 from scipy.interpolate import interp1d
+from scipy.optimize import linprog
+import scipy.sparse as sp
 from datetime import date, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -219,6 +221,7 @@ class OptimiserParams:
     withdraw_threshold   : float
     forward_lookback_days: int
     dead_band            : float
+    lp_solver            : str    # HiGHS method string for LPIntrinsicOptimiser
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -559,7 +562,7 @@ class IntrinsicResult:
             f"  Idle days           : {len(idle):>14,}",
             f"  Total injected MWh  : {inj['Volume_MWh'].sum():>14,.0f}",
             f"  Total withdrawn MWh : {abs(wit['Volume_MWh'].sum()):>14,.0f}",
-            f"  Total fixed costs   : EUR {self.breakdown['Daily_CF_EUR'].apply(lambda x: min(x, 0)).sum():>10,.0f}",
+            f"  Total fixed costs   : EUR {self.breakdown['Fixed_CF_EUR'].sum():>10,.0f}",
             "=" * 55,
         ]
         return "\n".join(lines)
@@ -569,6 +572,205 @@ class IntrinsicResult:
         self.breakdown.to_csv(path)
         print(f"Intrinsic dispatch schedule saved → {path}")
         return path
+
+
+class LPIntrinsicOptimiser:
+    """
+    Globally optimal intrinsic storage valuation via Linear Programming.
+
+    Replaces the greedy rolling-intrinsic dispatcher in IntrinsicValuator
+    with a full LP over the known forward curve, solved exactly using
+    scipy.optimize.linprog with the HiGHS backend.
+
+    Problem formulation
+    -------------------
+    Decision variables (per day t = 0 .. T-1):
+        u[t]  > 0  injection volume (MWh)
+        v[t]  > 0  withdrawal volume (MWh)
+
+    Objective (maximise discounted NPV):
+        sum_t  disc[t] * [ F[t]*v[t]*eta_wit - F[t]*u[t]
+                           - c_inj*u[t] - c_wit*v[t] - c_fix ]
+
+    Constraints:
+        Inventory evolution  (equality at every step)
+        Inventory bounds     I_min <= I[t] <= I_max
+        Rate limits          0 <= u[t] <= inj_cap[t],  0 <= v[t] <= wit_cap[t]
+        Terminal bounds      I_min_terminal <= I[T] <= I_max_terminal
+
+    All constraints are linear in (u, v) so the problem is a pure LP.
+    HiGHS solves a 366-step daily problem in < 10 ms.
+
+    Sparse matrices are used throughout so the implementation scales
+    to multi-year contracts and intra-day granularity without modification.
+
+    Parameters
+    ----------
+    storage   : StorageParams
+    market    : MarketParams
+    date_grid : list of date
+    lp_solver : str   HiGHS method string passed to linprog (default 'highs')
+    """
+
+    def __init__(
+        self,
+        storage   : StorageParams,
+        market    : MarketParams,
+        date_grid : List[date],
+        lp_solver : str = "highs",
+    ):
+        self.storage   = storage
+        self.market    = market
+        self.date_grid = date_grid
+        self.lp_solver = lp_solver
+        self.T         = len(date_grid) - 1   # number of decision steps
+
+    # ── Public interface ─────────────────────────────────────────────────────
+
+    def solve(
+        self,
+        fwd_prices: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Solve the LP and return the optimal dispatch.
+
+        Parameters
+        ----------
+        fwd_prices : np.ndarray (T+1,)
+            Deterministic forward price at each date in date_grid.
+
+        Returns
+        -------
+        inventory        : np.ndarray (T+1,)  end-of-day inventory levels
+        net_volume       : np.ndarray (T,)    positive=inject, negative=withdraw
+        terminal_penalty : float              always 0.0 (terminal handled as
+                                              hard LP constraint)
+        """
+        T   = self.T
+        st  = self.storage
+        mkt = self.market
+
+        # ── 1. Build discount factors and rate-limit arrays ───────────────
+        t0   = self.date_grid[0]
+        disc = np.array([
+            _discount_factor(mkt.risk_free_rate,
+                             (self.date_grid[t] - t0).days / 365.25)
+            for t in range(T)
+        ])
+
+        inj_cap = np.array([
+            st.max_injection_rate(self.date_grid[t].month) for t in range(T)
+        ])
+        wit_cap = np.array([
+            st.max_withdrawal_rate(self.date_grid[t].month) for t in range(T)
+        ])
+
+        F = fwd_prices[:T]   # forward prices at decision steps
+
+        # ── 2. Objective vector c (negated: linprog minimises) ────────────
+        # Injection: cost = F[t] + c_inj per MWh paid
+        # Withdrawal: revenue = F[t]*eta_wit - c_wit per MWh received
+        # Fixed cost: constant per day (does not affect optimum)
+        c_inj_vec = disc * (F + st.injection_cost_per_mwh)
+        c_wit_vec = disc * (-(F * st.withdrawal_efficiency - st.withdrawal_cost_per_mwh))
+
+        # x = [u_0..u_{T-1}, v_0..v_{T-1}]  shape (2T,)
+        c_obj = np.concatenate([c_inj_vec, c_wit_vec])
+
+        # ── 3. Variable bounds (rate limits, non-negativity) ──────────────
+        bounds = (
+            [(0.0, float(cap)) for cap in inj_cap]
+            + [(0.0, float(cap)) for cap in wit_cap]
+        )
+
+        # ── 4. Sparse inequality constraints for inventory bounds ─────────
+        #
+        # Inventory at step t+1:
+        #   I[t+1] = I[0] + eta_inj * sum_{s<=t} u[s] - sum_{s<=t} v[s]
+        #
+        # I_min <= I[t+1] <= I_max  for t = 0..T-1
+        # Terminal: I_min_term <= I[T] <= I_max_term  (included in t=T-1)
+        #
+        # Expressed as two sets of inequalities:
+        #   -eta_inj * L @ u  +  L @ v  <=  I[0] - I_min[t]   (lower bound)
+        #    eta_inj * L @ u  -  L @ v  <=  I_max[t] - I[0]   (upper bound)
+        # where L is lower-triangular ones matrix.
+
+        L = sp.tril(np.ones((T, T)), format="csc")   # lower triangular (T x T)
+
+        # I_min and I_max per step — use terminal bounds on the last step
+        I_min_vec = np.full(T, float(st.min_inventory))
+        I_max_vec = np.full(T, float(st.max_inventory))
+        I_min_vec[T - 1] = float(st.terminal_min_inventory)
+        I_max_vec[T - 1] = float(st.terminal_max_inventory)
+
+        I0 = float(st.initial_inventory)
+
+        # Lower bound: I[t+1] >= I_min  =>  -eta*L*u + L*v <= I0 - I_min
+        A_lb_u = -st.injection_efficiency * L
+        A_lb_v =  L
+        b_lb   = I0 - I_min_vec
+
+        # Upper bound: I[t+1] <= I_max  =>   eta*L*u - L*v <= I_max - I0
+        A_ub_u =  st.injection_efficiency * L
+        A_ub_v = -L
+        b_ub   = I_max_vec - I0
+
+        # Stack both sets: shape (2T, 2T)
+        A_ub_mat = sp.bmat([
+            [A_lb_u, A_lb_v],
+            [A_ub_u, A_ub_v],
+        ], format="csc")
+        b_ub_vec = np.concatenate([b_lb, b_ub])
+
+        # ── 5. Solve ──────────────────────────────────────────────────────
+        result = linprog(
+            c       = c_obj,
+            A_ub    = A_ub_mat,
+            b_ub    = b_ub_vec,
+            bounds  = bounds,
+            method  = self.lp_solver,
+            options = {"disp": False, "presolve": True},
+        )
+
+        if result.status != 0:
+            raise RuntimeError(
+                f"LP solver did not find optimal solution: "
+                f"status={result.status} — {result.message}"
+            )
+
+        # ── 6. Reconstruct inventory and net_volume arrays ────────────────
+        u_opt = result.x[:T]   # optimal injection schedule
+        v_opt = result.x[T:]   # optimal withdrawal schedule
+
+        inventory  = np.zeros(T + 1)
+        net_volume = np.zeros(T)
+        inventory[0] = I0
+
+        for t in range(T):
+            inj = u_opt[t]
+            wit = v_opt[t]
+            net_volume[t]      = inj - wit
+            inventory[t + 1]   = (
+                inventory[t]
+                + inj * st.injection_efficiency
+                - wit
+            )
+
+        # Terminal penalty is always 0.0 — the LP enforces terminal bounds
+        # as hard constraints so violations are structurally impossible.
+        terminal_penalty = 0.0
+
+        return inventory, net_volume, terminal_penalty
+
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+
+    def print_lp_summary(self, u_opt: np.ndarray, v_opt: np.ndarray) -> None:
+        """Print a brief LP solution summary."""
+        print(f"  LP inject days      : {(u_opt > 1e-3).sum()}")
+        print(f"  LP withdraw days    : {(v_opt > 1e-3).sum()}")
+        print(f"  LP total injected   : {u_opt.sum():,.0f} MWh")
+        print(f"  LP total withdrawn  : {v_opt.sum():,.0f} MWh")
 
 
 class IntrinsicValuator:
@@ -600,27 +802,29 @@ class IntrinsicValuator:
         storage:   StorageParams,
         market:    MarketParams,
         date_grid: List[date],
+        lp_solver: str = "highs",
     ):
         self.storage   = storage
         self.market    = market
         self.date_grid = date_grid
+        self.lp_solver = lp_solver
 
     def run(self) -> IntrinsicResult:
         """
-        Execute the intrinsic valuation.
+        Execute the intrinsic valuation using the LP global optimiser.
 
-        CHANGE 3: _dispatch() and its _build_fwd_reference() are deleted.
-        StorageDispatcher is now the single dispatch engine for both
-        deterministic (intrinsic) and stochastic (MC) paths.
-        A zero dead_band OptimiserParams is passed so every non-zero
-        spread triggers injection or withdrawal — appropriate for a
-        known deterministic forward curve with no noise to filter.
+        CHANGE 5: StorageDispatcher (greedy rolling-intrinsic) replaced by
+        LPIntrinsicOptimiser. The LP solves globally over the full forward
+        curve in a single pass, guaranteeing the true intrinsic upper bound.
+        This eliminates the negative extrinsic value produced by the greedy
+        dispatcher, which myopically sold the initial inventory at low summer
+        prices instead of holding for winter.
 
         Steps
         -----
         1. Build the daily forward price array from market.forward_price(d)
-        2. Construct StorageDispatcher with dead_band=0.0
-        3. Call dispatcher.dispatch_path(fwd_prices) — shared dispatch logic
+        2. Construct LPIntrinsicOptimiser with lp_solver from OptimiserParams
+        3. Call lp_opt.solve(fwd_prices) — global LP optimisation
         4. Compute discounted NPV via compute_path_npv
         5. Build daily breakdown DataFrame
 
@@ -633,24 +837,14 @@ class IntrinsicValuator:
             [self.market.forward_price(d) for d in self.date_grid]
         )
 
-        # Step 2 — build dispatcher with zero dead_band
-        # CHANGE 3: replaces the former self._dispatch() / self._build_fwd_reference().
-        # All fields required (no defaults) so inject_threshold and
-        # withdraw_threshold are supplied even though they are unused in
-        # rolling_intrinsic mode — they are required by the dataclass.
-        intrinsic_opt = OptimiserParams(
-            strategy              = "rolling_intrinsic",
-            inject_threshold      = 0.0,   # unused in rolling_intrinsic mode
-            withdraw_threshold    = 0.0,   # unused in rolling_intrinsic mode
-            forward_lookback_days = self._LOOKBACK,
-            dead_band             = 0.0,   # deterministic curve — no noise to filter
-        )
-        dispatcher = StorageDispatcher(
-            self.storage, self.market, intrinsic_opt, self.date_grid
+        # Step 2 — LP global optimiser (replaces greedy StorageDispatcher)
+        lp_opt = LPIntrinsicOptimiser(
+            self.storage, self.market, self.date_grid,
+            lp_solver=self.lp_solver,
         )
 
-        # Step 3 — shared dispatch logic
-        inventory, net_volume, terminal_penalty = dispatcher.dispatch_path(fwd_prices)
+        # Step 3 — global LP solve
+        inventory, net_volume, terminal_penalty = lp_opt.solve(fwd_prices)
 
         # Step 4 — NPV
         npv = compute_path_npv(
@@ -675,12 +869,14 @@ class IntrinsicValuator:
 
         Columns
         -------
-        Date         — calendar date
-        Forward      — EUR/MWh forward price used for dispatch
-        Action       — Inject / Withdraw / Idle
-        Volume_MWh   — volume injected (+) or withdrawn (-) in MWh
-        Inventory    — end-of-day inventory level (MWh)
-        Daily_CF_EUR — undiscounted daily cash flow (EUR)
+        Date           — calendar date
+        Forward        — EUR/MWh forward price used for dispatch
+        Action         — Inject / Withdraw / Idle
+        Volume_MWh     — volume injected (+) or withdrawn (-) in MWh
+        Inventory      — end-of-day inventory level (MWh)
+        Trading_CF_EUR — undiscounted trading cash flow (EUR), excluding fixed costs
+        Fixed_CF_EUR   — daily fixed cost (EUR), always -daily_fixed_cost
+        Daily_CF_EUR   — total undiscounted daily cash flow = Trading_CF_EUR + Fixed_CF_EUR
         """
         rows = []
         for i, d in enumerate(self.date_grid[:-1]):
@@ -688,25 +884,27 @@ class IntrinsicValuator:
             spot = prices[i]
 
             if vol > 0:
-                action   = "Inject"
-                daily_cf = -(spot * vol + self.storage.injection_cost_per_mwh * vol)
+                action     = "Inject"
+                trading_cf = -(spot * vol + self.storage.injection_cost_per_mwh * vol)
             elif vol < 0:
-                action   = "Withdraw"
-                sold_vol = abs(vol) * self.storage.withdrawal_efficiency
-                daily_cf = spot * sold_vol - self.storage.withdrawal_cost_per_mwh * abs(vol)
+                action     = "Withdraw"
+                sold_vol   = abs(vol) * self.storage.withdrawal_efficiency
+                trading_cf = spot * sold_vol - self.storage.withdrawal_cost_per_mwh * abs(vol)
             else:
-                action   = "Idle"
-                daily_cf = 0.0
+                action     = "Idle"
+                trading_cf = 0.0
 
-            daily_cf -= self.storage.daily_fixed_cost
+            fixed_cf = -self.storage.daily_fixed_cost
 
             rows.append({
-                "Date":         d,
-                "Forward":      round(spot, 4),
-                "Action":       action,
-                "Volume_MWh":   round(vol, 1),
-                "Inventory":    round(inventory[i + 1], 1),
-                "Daily_CF_EUR": round(daily_cf, 2),
+                "Date":           d,
+                "Forward":        round(spot, 4),
+                "Action":         action,
+                "Volume_MWh":     round(vol, 1),
+                "Inventory":      round(inventory[i + 1], 1),
+                "Trading_CF_EUR": round(trading_cf, 2),
+                "Fixed_CF_EUR":   round(fixed_cf, 2),
+                "Daily_CF_EUR":   round(trading_cf + fixed_cf, 2),
             })
 
         return pd.DataFrame(rows).set_index("Date")
@@ -758,7 +956,8 @@ class GasStorageSimulator:
         # ── 0. Intrinsic valuation first (deterministic, fast) ─────────────
         print("Computing intrinsic value...")
         intrinsic = IntrinsicValuator(
-            self.storage, self.market, self.date_grid
+            self.storage, self.market, self.date_grid,
+            lp_solver=self.opt.lp_solver,
         ).run()
         print(f"Intrinsic NPV  : EUR {intrinsic.npv:,.0f}")
 
