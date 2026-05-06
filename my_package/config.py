@@ -19,6 +19,12 @@ SIMULATION = dict(
     seed           = 42,       # RNG seed (None = non-deterministic)
     antithetic     = True,     # use antithetic variates for variance reduction
     n_workers      = 4,        # parallel workers (set 1 to disable)
+
+    # Price process selector.
+    # "lognormal_ou"  — single-factor lognormal OU (default, fastest)
+    # "schwartz_smith" — two-factor Schwartz-Smith (seasonal spread model)
+    # "heston"         — Heston stochastic vol (QuantLib QE scheme, slowest)
+    process_model  = "lognormal_ou",
 )
 
 # ── Calendar / Dates ─────────────────────────────────────────────────────────
@@ -29,21 +35,18 @@ CALENDAR = dict(
 )
 
 # ── Market Parameters ────────────────────────────────────────────────────────
-# Ornstein-Uhlenbeck (mean-reverting) process:
-#   dS = kappa*(theta - S)*dt + sigma*S*dW   [lognormal OU / Black-like]
-#
-# For a pure additive OU:
-#   dX = kappa*(theta - X)*dt + sigma*dW
-# We implement the lognormal variant (log-prices follow OU) to avoid negatives.
+# Shared market observables used across all models and the discounting layer.
+# theta is the flat forward price fallback used by MarketParams.forward_price()
+# when no forward_curve is provided; it doubles as the OU long-run mean target
+# but is market data, not a process parameter.
+# Process-specific dynamics (kappa, sigma) live in OU below.
 MARKET = dict(
     spot_price     = 35.50,   # EUR/MWh, current TTF front month
-    kappa          = 2.0,     # mean-reversion speed (per year); ~6-month half-life
-    theta          = 38.00,   # long-run mean price (EUR/MWh)
-    sigma          = 0.45,    # annual volatility (log-price diffusion)
+    theta          = 38.00,   # long-run mean / flat forward fallback (EUR/MWh)
     risk_free_rate = 0.035,   # continuous discount rate (EUR, 3.5%)
 
     # Optional: forward curve override (date -> EUR/MWh).
-    # If provided, the OU process is centred on the forward rather than theta.
+    # If provided, forward_price(d) interpolates here; otherwise returns theta.
     # Set to None to use flat theta.
     forward_curve  = {
         date(2026,  5,  1): 35.80,
@@ -59,6 +62,20 @@ MARKET = dict(
         date(2027,  3,  1): 40.00,
         date(2027,  4,  1): 36.00,
     },
+)
+
+# ── Lognormal OU Process Parameters ──────────────────────────────────────────
+# Used when SIMULATION["process_model"] == "lognormal_ou".
+# spot_price is shared with MARKET; the forward_price() callable is supplied
+# by MarketParams and injected by the process factory — not duplicated here.
+#
+# Calibration guidance:
+#   kappa : AR(1) on daily log-returns: kappa = -ln(phi)/dt
+#           where phi is the lag-1 autocorrelation of log-returns
+#   sigma : annualised std of log-return residuals from the same regression
+OU = dict(
+    kappa = 2.0,    # mean-reversion speed (yr-1); half-life = ln(2)/kappa ~ 4 months
+    sigma = 0.45,   # annual log-price volatility
 )
 
 # ── Storage Facility ─────────────────────────────────────────────────────────
@@ -120,6 +137,47 @@ OPTIMISER = dict(
     # "highs" is the default scipy/HiGHS solver — fast, exact, open-source.
     # Other valid options: "highs-ds" (dual simplex), "highs-ipm" (interior point).
     lp_solver = "highs",
+)
+
+# ── Two-Factor Schwartz-Smith Parameters ────────────────────────────────
+# Used when SIMULATION["process_model"] == "schwartz_smith".
+# spot_price is shared with MARKET and injected by the process factory.
+#
+# Calibration guidance:
+#   kappa_xi  : fit to ATM implied vol term structure (fast decay = high kappa)
+#   sigma_xi  : short-dated implied vol level
+#   sigma_eta : long-dated (1y+) implied vol level
+#   rho       : correlation from historical regression of monthly vs annual returns
+#   mu_eta    : risk-neutral drift = 0 (no risk premium in Q measure)
+#   eta_0     : ln(F_LT) where F_LT is the last pillar of the forward curve
+#               — set to None to derive automatically from MARKET["forward_curve"]
+SCHWARTZ = dict(
+    eta_0      = None,    # EUR/MWh; None → last pillar of MARKET["forward_curve"]
+    kappa_xi   = 2.0,     # short-term mean-reversion speed (yr⁻¹), half-life ~4 months
+    sigma_xi   = 0.35,    # short-term factor volatility
+    mu_eta     = 0.0,     # long-term drift (risk-neutral Q measure: 0)
+    sigma_eta  = 0.15,    # long-term factor volatility
+    rho        = -0.20,   # factor correlation dW₁·dW₂
+)
+
+# ── Heston Stochastic Volatility Parameters ───────────────────────────────
+# Used when SIMULATION["process_model"] == "heston".
+# spot_price and risk_free_rate are shared with MARKET.
+#
+# Calibration guidance:
+#   v0, theta_v : current and long-run variance = sigma² if using MARKET["sigma"]
+#                 set to None to derive automatically from MARKET["sigma"]
+#   kappa       : fit jointly with xi from implied vol surface curvature
+#   xi          : vol-of-vol controls vol smile steepness
+#   rho         : typically negative for energy (spot-vol leverage effect)
+#   Feller:     2*kappa*theta_v > xi² for a.s. positive variance
+HESTON = dict(
+    v0         = None,    # initial variance; None → MARKET["sigma"]**2
+    kappa      = 2.0,     # variance mean-reversion speed (yr⁻¹)
+    theta_v    = None,    # long-run variance; None → MARKET["sigma"]**2
+    xi         = 0.40,    # vol-of-vol
+    rho        = -0.60,   # correlation spot-variance
+    use_sobol  = False,   # Sobol quasi-random (slower setup, better convergence)
 )
 
 # ── Output ───────────────────────────────────────────────────────────────────

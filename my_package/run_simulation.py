@@ -33,6 +33,8 @@ from gas_storage_mc import (
     MarketParams,
     SimulationParams,
     OptimiserParams,
+    OUParams,
+    ProcessParams,
     GasStorageSimulator,
 )
 
@@ -63,10 +65,38 @@ def build_params():
     sim_params = SimulationParams(**cfg.SIMULATION)
     opt_params = OptimiserParams(**cfg.OPTIMISER)
 
+    # ProcessParams — merge OU, SCHWARTZ and HESTON dicts.
+    # Each model's parameters are namespaced to avoid collision:
+    #   OU     : kappa_ou, sigma_ou
+    #   SCHWARTZ: rho (factor correlation)
+    #   HESTON : kappa_heston, rho_heston
+    ou       = dict(cfg.OU)           # kappa, sigma
+    schwartz = dict(cfg.SCHWARTZ)     # eta_0, kappa_xi, sigma_xi, mu_eta, sigma_eta, rho
+    heston   = dict(cfg.HESTON)       # v0, kappa, theta_v, xi, rho, use_sobol
+    proc_params = ProcessParams(
+        # OU fields — rename kappa/sigma to kappa_ou/sigma_ou
+        kappa_ou    = ou["kappa"],
+        sigma_ou    = ou["sigma"],
+        # Schwartz-Smith fields — passed through unchanged
+        eta_0       = schwartz["eta_0"],
+        kappa_xi    = schwartz["kappa_xi"],
+        sigma_xi    = schwartz["sigma_xi"],
+        mu_eta      = schwartz["mu_eta"],
+        sigma_eta   = schwartz["sigma_eta"],
+        rho         = schwartz["rho"],
+        # Heston fields — rename kappa → kappa_heston, rho → rho_heston
+        v0          = heston["v0"],
+        kappa_heston= heston["kappa"],
+        theta_v     = heston["theta_v"],
+        xi          = heston["xi"],
+        rho_heston  = heston["rho"],
+        use_sobol   = heston["use_sobol"],
+    )
+
     start = cfg.CALENDAR["start_date"]
     end   = cfg.CALENDAR["end_date"]
 
-    return storage, market, sim_params, opt_params, start, end
+    return storage, market, sim_params, opt_params, proc_params, start, end
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -80,19 +110,19 @@ def main():
     print("╚══════════════════════════════════════════════════════╝")
     print()
 
-    storage, market, sim_params, opt_params, start, end = build_params()
+    storage, market, sim_params, opt_params, proc_params, start, end = build_params()
 
     simulator = GasStorageSimulator(
-        storage=storage,
-        market=market,
-        sim=sim_params,
-        opt=opt_params,
-        start=start,
-        end=end,
+        storage     = storage,
+        market      = market,
+        sim         = sim_params,
+        opt         = opt_params,
+        proc_params = proc_params,
+        start       = start,
+        end         = end,
     )
 
     t0 = time.perf_counter()
-    daily_fwd_curve = market.print_forward_curve(start=date(2026, 4, 17), end=date(2027, 4, 17))
     results = simulator.run()
     elapsed = time.perf_counter() - t0
     print(f"Runtime: {elapsed:.1f}s\n")

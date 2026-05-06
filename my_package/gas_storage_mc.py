@@ -87,17 +87,19 @@ class StorageParams:
 @dataclass
 class MarketParams:
     """
-    Market and price-process parameters.
+    Shared market observables — spot price, discount rate, forward curve, flat fallback.
     All values must be supplied explicitly — config.py is the single source of truth.
+
+    kappa and sigma have been moved to OUParams (config.OU) because they are
+    process parameters, not market observables.  theta is kept here because it
+    serves as the flat forward price fallback in forward_price() and is market data.
 
     forward_curve : Optional[Dict[date, float]]
         Monthly TTF forward pillars {date: EUR/MWh}. Pass None to use flat theta.
         Kept Optional here because None is a legitimate runtime value, not a default.
     """
     spot_price    : float
-    kappa         : float
     theta         : float
-    sigma         : float
     risk_free_rate: float
     forward_curve : Optional[Dict[date, float]]
 
@@ -197,11 +199,19 @@ class SimulationParams:
     """
     Monte Carlo simulation settings.
     All values must be supplied explicitly — config.py is the single source of truth.
+
+    process_model : str
+        Selects the stochastic price process used for MC path generation.
+        "lognormal_ou"   — single-factor lognormal OU (exact analytic, fast)
+        "schwartz_smith" — two-factor Schwartz-Smith (exact analytic, seasonal)
+        "heston"         — Heston stochastic vol (QuantLib QE scheme)
+        Process-specific parameters are held in ProcessParams (see below).
     """
-    n_paths   : int
-    seed      : Optional[int]
-    antithetic: bool
-    n_workers : int
+    n_paths       : int
+    seed          : Optional[int]
+    antithetic    : bool
+    n_workers     : int
+    process_model : str
 
 
 @dataclass
@@ -222,6 +232,155 @@ class OptimiserParams:
     forward_lookback_days: int
     dead_band            : float
     lp_solver            : str    # HiGHS method string for LPIntrinsicOptimiser
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ProcessParams — process-specific parameters (single source: config.py)
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OUParams:
+    """
+    Lognormal OU process parameters.
+    Constructed from config.OU in run_simulation.build_params().
+
+    Fields used by model
+    --------------------
+    lognormal_ou : kappa, sigma
+    """
+    kappa : float   # mean-reversion speed (yr-1)
+    sigma : float   # annual log-price volatility
+
+
+@dataclass
+class ProcessParams:
+    """
+    Holds all process-specific parameters for the three supported models.
+    Constructed in run_simulation.py via build_params() by merging OU,
+    SCHWARTZ and HESTON dicts from config.py.
+
+    Fields used per model
+    ---------------------
+    lognormal_ou   : kappa_ou, sigma_ou
+    schwartz_smith : eta_0, kappa_xi, sigma_xi, mu_eta, sigma_eta, rho
+    heston         : v0, kappa_heston, theta_v, xi, rho_heston, use_sobol
+
+    Naming conventions
+    ------------------
+    OU fields use the _ou suffix; Heston fields use _heston, to make every
+    field unambiguously model-scoped and to prevent accidental cross-use.
+    The process factory maps these to the correct constructor argument names.
+    """
+    # Lognormal OU fields
+    kappa_ou   : float
+    sigma_ou   : float
+    # Schwartz-Smith fields
+    eta_0      : Optional[float]  # EUR/MWh; None → resolved from forward curve
+    kappa_xi   : float
+    sigma_xi   : float
+    mu_eta     : float
+    sigma_eta  : float
+    rho        : float            # Schwartz-Smith factor correlation
+    # Heston fields
+    v0         : Optional[float]  # None → resolved from sigma_ou**2
+    kappa_heston: float
+    theta_v    : Optional[float]  # None → resolved from sigma_ou**2
+    xi         : float
+    rho_heston : float            # Heston spot-variance correlation
+    use_sobol  : bool
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Process factory
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_process(
+    model      : str,
+    market     : "MarketParams",
+    sim        : SimulationParams,
+    proc_params: ProcessParams,
+    date_grid  : List[date],
+):
+    """
+    Instantiate and return the correct process class for the given model string.
+
+    Parameters
+    ----------
+    model       : sim.process_model — "lognormal_ou" | "schwartz_smith" | "heston"
+    market      : MarketParams — provides spot_price, kappa, sigma, risk_free_rate,
+                  forward_price() callable.  Shared params are read from here;
+                  never duplicated in ProcessParams.
+    sim         : SimulationParams — provides n_paths, seed, antithetic
+    proc_params : ProcessParams — process-specific params from config.SCHWARTZ / HESTON
+    date_grid   : List[date] — used only for eta_0 auto-resolution (Schwartz-Smith)
+
+    Returns
+    -------
+    A process instance with a .simulate(date_grid) -> PathBundle method.
+
+    Raises
+    ------
+    ValueError if model string is not recognised.
+    """
+    from processes import (
+        LognormalOUProcess,
+        TwoFactorSchwartzProcess,
+        HestonProcess,
+    )
+
+    if model == "lognormal_ou":
+        return LognormalOUProcess(
+            spot_price = market.spot_price,
+            kappa      = proc_params.kappa_ou,
+            sigma      = proc_params.sigma_ou,
+            fwd_func   = market.forward_price,
+            n_paths    = sim.n_paths,
+            seed       = sim.seed,
+            antithetic = sim.antithetic,
+        )
+
+    elif model == "schwartz_smith":
+        # eta_0: last pillar of the forward curve if not explicitly set
+        if proc_params.eta_0 is not None:
+            eta_0 = proc_params.eta_0
+        elif market.forward_curve is not None:
+            eta_0 = market.forward_curve[max(market.forward_curve)]
+        else:
+            eta_0 = market.theta   # fallback to flat long-run mean
+
+        return TwoFactorSchwartzProcess(
+            spot_price = market.spot_price,
+            eta_0      = eta_0,
+            kappa_xi   = proc_params.kappa_xi,
+            sigma_xi   = proc_params.sigma_xi,
+            mu_eta     = proc_params.mu_eta,
+            sigma_eta  = proc_params.sigma_eta,
+            rho        = proc_params.rho,
+            n_paths    = sim.n_paths,
+            seed       = sim.seed,
+            antithetic = sim.antithetic,
+        )
+
+    elif model == "heston":
+        sigma_sq = proc_params.sigma_ou ** 2   # OU sigma as default variance proxy
+        return HestonProcess(
+            spot_price     = market.spot_price,
+            risk_free_rate = market.risk_free_rate,
+            v0             = proc_params.v0      if proc_params.v0      is not None else sigma_sq,
+            kappa          = proc_params.kappa_heston,
+            theta_v        = proc_params.theta_v if proc_params.theta_v is not None else sigma_sq,
+            xi             = proc_params.xi,
+            rho            = proc_params.rho_heston,
+            n_paths        = sim.n_paths,
+            seed           = sim.seed,
+            use_sobol      = proc_params.use_sobol,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown process_model {model!r}. "
+            "Choose: 'lognormal_ou', 'schwartz_smith', 'heston'."
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -437,13 +596,13 @@ class StorageDispatcher:
         if terminal_inventory < self.storage.terminal_min_inventory:
             terminal_penalty = (
                 (self.storage.terminal_min_inventory - terminal_inventory)
-                * prices[-1] * 5.0   # penalty = 5x market price per MWh shortfall
+                * prices[-1] * 3.0   # penalty = 5x market price per MWh shortfall
             )
         # Any gas above terminal_max is penalised too (can't store it)
         if terminal_inventory > self.storage.terminal_max_inventory:
             terminal_penalty += (
                 (terminal_inventory - self.storage.terminal_max_inventory)
-                * prices[-1] * 5.0
+                * prices[-1] * 3.0
             )
 
         return inventory, net_volume, terminal_penalty
@@ -920,16 +1079,17 @@ class GasStorageSimulator:
 
     Parameters
     ----------
-    storage  : StorageParams
-    market   : MarketParams
-    sim      : SimulationParams
-    opt      : OptimiserParams
-    start    : date   — contract start
-    end      : date   — contract end
+    storage     : StorageParams
+    market      : MarketParams
+    sim         : SimulationParams    — includes process_model selector
+    opt         : OptimiserParams
+    proc_params : ProcessParams       — process-specific params (Schwartz / Heston)
+    start       : date                — contract start
+    end         : date                — contract end
 
     Usage
     -----
-    >>> sim = GasStorageSimulator(storage, market, sim_params, opt_params, start, end)
+    >>> sim = GasStorageSimulator(storage, market, sim_params, opt_params, proc_params, start, end)
     >>> results = sim.run()
     >>> print(results.summary())
     >>> results.plot_npv_histogram("storage_npv.png")
@@ -937,18 +1097,20 @@ class GasStorageSimulator:
 
     def __init__(
         self,
-        storage: StorageParams,
-        market: MarketParams,
-        sim: SimulationParams,
-        opt: OptimiserParams,
-        start: date,
-        end: date,
+        storage     : StorageParams,
+        market      : MarketParams,
+        sim         : SimulationParams,
+        opt         : OptimiserParams,
+        proc_params : ProcessParams,
+        start       : date,
+        end         : date,
     ):
-        self.storage = storage
-        self.market = market
-        self.sim = sim
-        self.opt = opt
-        self.date_grid = _build_date_grid(start, end)
+        self.storage     = storage
+        self.market      = market
+        self.sim         = sim
+        self.opt         = opt
+        self.proc_params = proc_params
+        self.date_grid   = _build_date_grid(start, end)
 
     def run(self) -> "SimulationResults":
         """Execute Monte Carlo simulation and return results."""
@@ -965,9 +1127,17 @@ class GasStorageSimulator:
         print(f"Simulating {self.sim.n_paths:,} paths over "
               f"{len(self.date_grid)} days...")
 
-        # 1. Generate price paths
-        process = LognormalOUProcess(self.market, self.sim)
-        price_paths = process.simulate(self.date_grid)  # (n_paths, n_steps)
+        # 1. Generate price paths via process factory
+        # The factory reads sim.process_model and constructs the correct
+        # process class, pulling shared params from market and sim and
+        # process-specific params from proc_params.  price_paths is always
+        # the .spots array of the returned PathBundle.
+        process    = build_process(
+            self.sim.process_model, self.market, self.sim,
+            self.proc_params, self.date_grid,
+        )
+        bundle     = process.simulate(self.date_grid)
+        price_paths = bundle.spots   # (n_paths, n_steps)
 
         # 2. Dispatch + NPV for each path
         dispatcher = StorageDispatcher(
@@ -999,6 +1169,7 @@ class GasStorageSimulator:
             sample_inventories=np.array(sample_inventories),
             market=self.market,
             sim_params=self.sim,
+            proc_params=self.proc_params,
             intrinsic_result=intrinsic,
         )
 
@@ -1020,19 +1191,25 @@ class GasStorageSimulator:
     def vega(self, bump: float = 0.01) -> float:
         """
         Volatility vega: dNPV / d_sigma estimated by bump-and-revalue.
-        Bumps sigma by ±`bump` (e.g. 0.01 = 1 vol point).
+        Bumps sigma_ou by +/-`bump` (e.g. 0.01 = 1 vol point).
+        For Schwartz-Smith, bump sigma_xi (the dominant short-term vol).
+        For Heston, bump xi (vol-of-vol) and v0/theta_v simultaneously.
+        Current implementation bumps sigma_ou which feeds the OU branch
+        and the Heston v0/theta_v defaults.
         """
-        base_sigma = self.market.sigma
-        self.market.sigma = base_sigma + bump
+        base = self.proc_params.sigma_ou
+        self.proc_params.sigma_ou = base + bump
         r_up = self.run()
-        self.market.sigma = base_sigma - bump
+        self.proc_params.sigma_ou = base - bump
         r_dn = self.run()
-        self.market.sigma = base_sigma   # restore
+        self.proc_params.sigma_ou = base   # restore
         return (r_up.mean_npv - r_dn.mean_npv) / (2.0 * bump)
 
     def theta_sensitivity(self, bump: float = 1.0) -> float:
         """
-        Mean-reversion level sensitivity: dNPV / d_theta.
+        Long-run mean / flat forward level sensitivity: dNPV / d_theta.
+        Bumps MarketParams.theta which is the flat forward fallback and the
+        OU mean-reversion target when no forward_curve is provided.
         """
         base_theta = self.market.theta
         self.market.theta = base_theta + bump
@@ -1058,6 +1235,7 @@ class SimulationResults:
         sample_inventories: np.ndarray,
         market: MarketParams,
         sim_params: SimulationParams,
+        proc_params: "ProcessParams",
         intrinsic_result: Optional["IntrinsicResult"] = None,
     ):
         self.npvs = npvs
@@ -1066,6 +1244,7 @@ class SimulationResults:
         self.sample_inventories = sample_inventories
         self.market = market
         self.sim_params = sim_params
+        self.proc_params = proc_params
         self.intrinsic_result = intrinsic_result
 
     @property
@@ -1089,9 +1268,10 @@ class SimulationResults:
             f"  Paths simulated   : {len(self.npvs):>12,}",
             f"  Simulation period : {self.date_grid[0]} → {self.date_grid[-1]}",
             f"  Spot price (S0)   : EUR {self.market.spot_price:>10.2f} / MWh",
-            f"  OU kappa          : {self.market.kappa:>12.3f}",
-            f"  OU theta          : EUR {self.market.theta:>10.2f} / MWh",
-            f"  OU sigma          : {self.market.sigma:>12.1%}",
+            f"  Process model     : {self.sim_params.process_model!r}",
+            f"  OU kappa          : {self.proc_params.kappa_ou:>12.3f}",
+            f"  OU sigma          : {self.proc_params.sigma_ou:>12.1%}",
+            f"  Theta (fwd flat)  : EUR {self.market.theta:>10.2f} / MWh",
             "-" * 55,
             f"  Mean NPV          : EUR {self.mean_npv:>14,.0f}",
             f"  Std Dev           : EUR {self.std_npv:>14,.0f}",
