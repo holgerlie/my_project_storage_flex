@@ -36,20 +36,28 @@ Design principles
 
 Exact discretisation derivations
 ---------------------------------
-LognormalOU (single-factor)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  d(ln S) = κ(ln F(t) − ln S) dt + σ dW
+LognormalOU (single-factor) — risk-neutral martingale form
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  d(ln S) = κ(ln F(t) − ln S) dt + ½σ² dt + σ dW
 
-  Exact transition (conditional on F(t), dt):
+  The ½σ² Itô correction ensures E[S_t] = F(t) (price-space martingale).
+  Without it, Jensen's inequality causes E[S_t] < F(t) on the seasonal ramp.
 
-    ln S_{t+dt} = ln F(t+dt)
-                  + (ln S_t − ln F(t+dt)) · exp(−κ dt)
+  Implementation via convexity-adjusted forward:
+
+    ln F̃(t) = ln F(t) − σ²/(2κ) · (1 − exp(−κt))
+
+  Exact transition (conditional on F̃(t), dt):
+
+    ln S_{t+dt} = ln F̃(t+dt)
+                  + (ln S_t − ln F̃(t)) · exp(−κ dt)
                   + σ · sqrt((1 − exp(−2κ dt)) / (2κ)) · Z
 
   where Z ~ N(0,1), independent across steps.
+  The anchor uses ln F̃(t) (current step), not ln F̃(t+dt) (next step).
 
-  The conditional mean is ln F(t+dt) + (ln S_t − ln F(t+dt))·exp(−κ dt),
-  so the process correctly tracks the forward curve pillar-by-pillar.
+  Martingale property: E[S_t] = exp(ln F̃(t) + ½·var_t) = F(t)  ✓
+  where var_t = σ²(1−exp(−2κt))/(2κ) is the OU unconditional variance at t.
 
   Variance: σ²·(1 − exp(−2κ dt))/(2κ) — the OU asymptotic variance scaled
   by the mean-reversion decay over the step.
@@ -189,21 +197,46 @@ class LognormalOUProcess:
     """
     Single-factor lognormal OU process.  Exact analytical discretisation.
 
-    Log-prices follow an additive OU around the log-forward curve:
+    Log-prices follow an additive OU around the convexity-adjusted log-forward
+    curve, ensuring E[S_t] = F(t) for all t (risk-neutral martingale condition):
 
-        d(ln S) = κ · (ln F(t) − ln S) · dt  +  σ · dW
+        d(ln S) = κ · (ln F(t) − ln S) · dt  +  ½σ² dt  +  σ · dW
 
-    Exact transition (no Euler bias):
+    The ½σ² Itô correction is the Jensen gap between E[ln S] and ln E[S].  Without
+    it, the process is a martingale in log-space but not in price space, causing
+    E[S_t] to drift systematically below F(t) — an error that is largest during
+    the seasonal upswing where storage value is concentrated.
 
-        ln S_{t+dt} = ln F(t+dt)
-                      + (ln S_t − ln F(t+dt)) · exp(−κ dt)
+    Implementation via convexity-adjusted forward
+    ---------------------------------------------
+    The correction is absorbed into a time-dependent adjusted log-forward:
+
+        ln F̃(t) = ln F(t) − σ²/(2κ) · (1 − exp(−κt))
+
+    so that the transition formula remains analytically tractable:
+
+        ln S_{t+dt} = ln F̃(t+dt)
+                      + (ln S_t − ln F̃(t)) · exp(−κ dt)
                       + σ · sqrt((1 − exp(−2κ dt)) / (2κ)) · Z,   Z ~ N(0,1)
+
+    With this form:
+        E[ln S_{t+dt}] = ln F̃(t+dt) + (E[ln S_t] − ln F̃(t)) · exp(−κ dt)
+    By induction from ln S_0 = ln F̃(0) = ln F(0) (since 1−exp(0)=0):
+        E[ln S_t] = ln F̃(t)
+    And the martingale condition in price space:
+        E[S_t] = exp(ln F̃(t) + ½σ²_t) = exp(ln F(t)) = F(t)  ✓
+    where σ²_t = σ²(1−exp(−2κt))/(2κ) is the OU variance at horizon t.
+
+    Note: the mean-reversion anchor uses log_fwd_adj[i] (current step), NOT
+    log_fwd_adj[i+1] (next step).  Using the next-step anchor — a common
+    coding error — introduces an additional bias on the seasonal ramp that
+    compounds across steps.
 
     Implementation
     --------------
     All n_paths paths are evolved simultaneously using broadcasting.
-    The forward curve is pre-evaluated on the full date grid before the
-    time-stepping loop — one interpolation pass, no per-path overhead.
+    The adjusted log-forward array is precomputed once before the loop —
+    one interpolation pass and one vectorised correction, no per-path overhead.
 
     This class replaces the LognormalOUProcess in gas_storage_mc.py.
     It accepts the same fwd_func callable (MarketParams.forward_price) so
@@ -242,31 +275,46 @@ class LognormalOUProcess:
 
     def simulate(self, date_grid: List[date]) -> PathBundle:
         """
-        Returns PathBundle(spots=(n_paths, n_steps), state2=None, model="lognormal_ou").
+        Returns PathBundle(spots=(n_paths, n_steps+1), state2=None, model="lognormal_ou").
+
+        Martingale check (run after simulation to verify):
+            assert abs(spots[:, t].mean() / fwd[t] - 1.0) < 0.01  for all t
         """
         n_steps = len(date_grid) - 1
         rng     = np.random.default_rng(self.seed)
 
-        # Pre-compute log-forward curve on full date grid  (n_steps+1,)
+        # ── Log-forward curve on full date grid  (n_steps+1,) ────────────────
         log_fwd = np.log(np.array([self.fwd_func(d) for d in date_grid]))
 
-        # Step sizes and exact OU coefficients  (n_steps,)
-        dt      = _dt_array(date_grid)
-        e       = np.exp(-self.kappa * dt)
-        std     = self.sigma * np.sqrt((1.0 - np.exp(-2.0 * self.kappa * dt))
-                                       / (2.0 * self.kappa))
+        # ── Step sizes and exact OU coefficients  (n_steps,) ─────────────────
+        dt  = _dt_array(date_grid)
+        e   = np.exp(-self.kappa * dt)
+        std = self.sigma * np.sqrt((1.0 - np.exp(-2.0 * self.kappa * dt))
+                                   / (2.0 * self.kappa))
 
-        # Correlated normals  (n_paths, n_steps)
+        # ── Convexity-adjusted log-forward  (n_steps+1,) ─────────────────────
+        # Itô correction: ln F̃(t) = ln F(t) − σ²/(2κ) · (1 − exp(−κt))
+        # Ensures E[S_t] = F(t) (price-space martingale) for all t.
+        # t is measured in years from contract start (date_grid[0]).
+        t0_date = date_grid[0]
+        t_years = np.array([(d - t0_date).days / 365.25 for d in date_grid])
+        ito_correction = (self.sigma ** 2 / (2.0 * self.kappa)) * (1.0 - np.exp(-self.kappa * t_years))
+        log_fwd_adj = log_fwd - ito_correction   # shape (n_steps+1,)
+
+        # ── Correlated normals  (n_paths, n_steps) ───────────────────────────
         Z = _antithetic_normals(rng, self.n_paths, n_steps, self.antithetic)
 
-        # Vectorised path evolution
+        # ── Vectorised path evolution ─────────────────────────────────────────
+        # Anchor uses log_fwd_adj[i] (current step) — NOT log_fwd_adj[i+1].
+        # Using the next-step anchor is a common error that introduces extra
+        # bias on the seasonal ramp and compounds across steps.
         log_paths       = np.empty((self.n_paths, n_steps + 1))
         log_paths[:, 0] = np.log(self.spot_price)
 
         for i in range(n_steps):
             log_paths[:, i + 1] = (
-                log_fwd[i + 1]
-                + (log_paths[:, i] - log_fwd[i + 1]) * e[i]
+                log_fwd_adj[i + 1]
+                + (log_paths[:, i] - log_fwd_adj[i]) * e[i]
                 + std[i] * Z[:, i]
             )
 

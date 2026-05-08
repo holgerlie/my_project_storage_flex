@@ -91,6 +91,14 @@ STORAGE = dict(
     terminal_min_inventory = 0,     # must leave at least this in store
     terminal_max_inventory = 2_000_000,
 
+    # Penalty multiplier for terminal inventory constraint violations (EUR/MWh shortfall
+    # expressed as a multiple of spot price).  Applied in both the greedy MC pipeline
+    # (StorageDispatcher / compute_path_npv) and the LSMC backward and forward passes.
+    # Must be defined once here to guarantee consistency across all three valuations.
+    # Economic interpretation: cost of sourcing / disposing of gas at short notice
+    # relative to spot price (e.g. 5x = 5 times the prevailing spot rate).
+    terminal_penalty_multiplier = 5.0,
+
     # Injection constraints (MWh/day); rates vary seasonally
     # Format: (month_start, month_end_inclusive) -> max_rate
     injection_rate_schedule = {

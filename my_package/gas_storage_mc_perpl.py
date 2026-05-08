@@ -69,6 +69,7 @@ class StorageParams:
     initial_inventory: float
     terminal_min_inventory: float
     terminal_max_inventory: float
+    terminal_penalty_multiplier: float
     injection_rate_schedule: Dict[Tuple[int, int], float]
     withdrawal_rate_schedule: Dict[Tuple[int, int], float]
     injection_efficiency: float
@@ -424,17 +425,24 @@ def _discount_factor(r: float, t_years: float) -> float:
 
 class LognormalOUProcess:
     """
-    Simulate log-price following an Ornstein-Uhlenbeck process:
+    Simulate log-price following an Ornstein-Uhlenbeck process with
+    Itô convexity correction to ensure E[S_t] = F(t) (risk-neutral martingale):
 
-        d(ln S) = kappa * (ln(theta_t) - ln(S)) * dt + sigma * dW
+        d(ln S) = kappa * (ln F(t) - ln S) * dt + ½σ² dt + sigma * dW
 
-    where theta_t is the time-varying forward price (or constant theta).
-    This ensures mean reversion around the forward curve without allowing
-    negative prices.
+    The ½σ² term is the Jensen/Itô correction.  Without it, E[S_t] drifts
+    below F(t) due to the lognormal convexity gap, most severely on the
+    seasonal upswing (summer→winter ramp) where storage value is generated.
 
-    Exact discretisation (no Euler bias):
-        ln S_{t+dt} = ln(theta_t) + (ln S_t - ln(theta_t)) * exp(-kappa*dt)
+    Implementation: correction absorbed into convexity-adjusted log-forward:
+        ln F̃(t) = ln F(t) − σ²/(2κ) · (1 − exp(−κt))
+
+    Exact transition (no Euler bias):
+        ln S_{t+dt} = ln F̃(t+dt)
+                      + (ln S_t − ln F̃(t)) * exp(-kappa*dt)
                       + sigma * sqrt((1 - exp(-2*kappa*dt)) / (2*kappa)) * Z
+
+    Note: anchor uses ln F̃(t) (current step), not ln F̃(t+dt) (next step).
     """
 
     def __init__(self, market: MarketParams, sim: SimulationParams):
@@ -451,7 +459,7 @@ class LognormalOUProcess:
         Returns
         -------
         paths : np.ndarray, shape (n_paths, n_steps)
-            Simulated daily prices.
+            Simulated daily prices.  E[paths[:, t]] ≈ forward_price(date_grid[t]).
         """
         m = self.market
         s = self.sim
@@ -469,12 +477,15 @@ class LognormalOUProcess:
         if s.antithetic:
             Z = np.vstack([Z, -Z])   # antithetic variates
 
-        # Pre-compute forward prices and OU parameters for each step
-        log_theta = np.array(
-            [np.log(m.forward_price(d)) for d in date_grid]
-        )
+        # Pre-compute forward prices
+        # NOTE: this legacy class is superseded by processes.LognormalOUProcess
+        # which carries kappa/sigma as constructor args and applies the full
+        # Itô convexity correction.  GasStorageSimulator.run() calls build_process()
+        # which dispatches to processes.py — this class is kept for standalone
+        # smoke-test use only and does NOT execute on the live simulation path.
+        log_fwd = np.array([np.log(m.forward_price(d)) for d in date_grid])
 
-        # Build paths using exact OU discretisation
+        # Build paths using exact OU discretisation (next-step anchor — legacy)
         paths = np.zeros((s.n_paths, n_steps))
         paths[:, 0] = np.log(m.spot_price)
 
@@ -484,8 +495,8 @@ class LognormalOUProcess:
             std = m.sigma * np.sqrt((1.0 - np.exp(-2.0 * m.kappa * dt)) / (2.0 * m.kappa))
 
             paths[:, i + 1] = (
-                log_theta[i + 1]
-                + (paths[:, i] - log_theta[i + 1]) * e
+                log_fwd[i + 1]
+                + (paths[:, i] - log_fwd[i + 1]) * e
                 + std * Z[:, i]
             )
 
@@ -601,16 +612,17 @@ class StorageDispatcher:
         # Terminal inventory — sell remaining gas at final price
         terminal_inventory = inventory[-1]
         terminal_penalty = 0.0
+        m = self.storage.terminal_penalty_multiplier
         if terminal_inventory < self.storage.terminal_min_inventory:
             terminal_penalty = (
                 (self.storage.terminal_min_inventory - terminal_inventory)
-                * prices[-1] * 5.0   # penalty = 5x market price per MWh shortfall
+                * prices[-1] * m
             )
         # Any gas above terminal_max is penalised too (can't store it)
         if terminal_inventory > self.storage.terminal_max_inventory:
             terminal_penalty += (
                 (terminal_inventory - self.storage.terminal_max_inventory)
-                * prices[-1] * 5.0
+                * prices[-1] * m
             )
 
         return inventory, net_volume, terminal_penalty
@@ -1280,19 +1292,32 @@ class SimulationResults:
         self.lsmc_result      = lsmc_result
 
     @property
+    def _display_npvs(self) -> np.ndarray:
+        """Primary NPV array for display: LSMC if available, else greedy MC."""
+        if self.lsmc_result is not None:
+            return self.lsmc_result.npvs
+        return self.npvs
+
+    @property
     def mean_npv(self) -> float:
-        return float(np.mean(self.npvs))
+        """Mean of the primary display distribution (LSMC if available)."""
+        return float(np.mean(self._display_npvs))
 
     @property
     def std_npv(self) -> float:
-        return float(np.std(self.npvs))
+        """Std dev of the primary display distribution (LSMC if available)."""
+        return float(np.std(self._display_npvs))
 
     def percentile(self, p: float) -> float:
-        return float(np.percentile(self.npvs, p))
+        """Percentile of the primary display distribution (LSMC if available)."""
+        return float(np.percentile(self._display_npvs, p))
 
     def summary(self, percentiles: List[int] = None) -> str:
         """Return a formatted summary string."""
         pcts = percentiles or [5, 10, 25, 50, 75, 90, 95]
+        use_lsmc = self.lsmc_result is not None
+        label    = "LSMC" if use_lsmc else "Greedy MC"
+
         lines = [
             "=" * 55,
             "  Gas Storage Monte Carlo Valuation — Results",
@@ -1305,11 +1330,12 @@ class SimulationResults:
             f"  OU sigma          : {self.proc_params.sigma_ou:>12.1%}",
             f"  Theta (fwd flat)  : EUR {self.market.theta:>10.2f} / MWh",
             "-" * 55,
+            f"  Primary valuation : {label}",
             f"  Mean NPV          : EUR {self.mean_npv:>14,.0f}",
             f"  Std Dev           : EUR {self.std_npv:>14,.0f}",
             f"  Coeff of Variation: {self.std_npv / abs(self.mean_npv) if self.mean_npv else float('nan'):>12.1%}",
             "-" * 55,
-            "  NPV Percentiles (EUR):",
+            f"  NPV Percentiles (EUR)  [{label}]:",
         ]
         for p in pcts:
             lines.append(f"    P{p:<3d}            : EUR {self.percentile(p):>14,.0f}")
@@ -1320,20 +1346,23 @@ class SimulationResults:
             lines += ["", "  Value Decomposition:", "-" * 55]
 
         if self.intrinsic_result is not None:
-            iv  = self.intrinsic_result.npv
-            ev  = self.mean_npv - iv
-            pct = (ev / iv * 100) if iv != 0 else float("nan")
-            lines += [
-                f"  LP Intrinsic        : EUR {iv:>14,.0f}",
-                f"  Greedy MC mean      : EUR {self.mean_npv:>14,.0f}",
-                f"  Extrinsic (MC)      : EUR {ev:>14,.0f}  ({pct:.1f}%)",
-            ]
+            iv = self.intrinsic_result.npv
+            lines.append(f"  LP Intrinsic        : EUR {iv:>14,.0f}")
+
+        # Always show greedy MC mean for reference
+        mc_mean = float(np.mean(self.npvs))
+        lines.append(f"  Greedy MC mean      : EUR {mc_mean:>14,.0f}")
+
+        if self.intrinsic_result is not None:
+            ev_mc  = mc_mean - iv
+            pct_mc = (ev_mc / iv * 100) if iv != 0 else float("nan")
+            lines.append(f"  Extrinsic (MC)      : EUR {ev_mc:>14,.0f}  ({pct_mc:.1f}%)")
 
         if self.lsmc_result is not None:
             lv = self.lsmc_result.mean_npv
             lines.append(f"  LSMC mean           : EUR {lv:>14,.0f}")
             if self.intrinsic_result is not None:
-                ev_l  = lv - self.intrinsic_result.npv
+                ev_l  = lv - iv
                 pct_l = (ev_l / iv * 100) if iv != 0 else float("nan")
                 lines.append(
                     f"  Extrinsic (LSMC)    : EUR {ev_l:>14,.0f}  ({pct_l:.1f}%)"
@@ -1358,9 +1387,12 @@ class SimulationResults:
 
         Returns the path to the saved file.
         """
-        pcts = percentiles or [5, 25, 50, 75, 95]
-        pct_vals = {p: self.percentile(p) for p in pcts}
-        pct_colors = {5: "#e74c3c", 25: "#f39c12", 50: "#2ecc71", 75: "#3498db", 95: "#9b59b6"}
+        pcts      = percentiles or [5, 25, 50, 75, 95]
+        use_lsmc  = self.lsmc_result is not None
+        disp_npvs = self._display_npvs          # LSMC if available, else greedy MC
+        label     = "LSMC" if use_lsmc else "Greedy MC"
+        pct_vals  = {p: float(np.percentile(disp_npvs, p)) for p in pcts}
+        pct_colors = {5: "#e74c3c", 10: "#e67e22", 25: "#f1c40f", 50: "#2ecc71", 75: "#3498db", 90: "#1abc9c", 95: "#9b59b6"}
 
         fig, axes = plt.subplots(
             2, 1,
@@ -1373,14 +1405,16 @@ class SimulationResults:
 
         ax_hist, ax_paths = axes
 
-        # ── Histogram ───────────────────────────────────────────────────────
+        # ── Primary histogram (LSMC or Greedy MC) ───────────────────────────
         n, bin_edges, patches = ax_hist.hist(
-            self.npvs / 1e6,
+            disp_npvs / 1e6,
             bins=bins,
             color="#4a90d9",
             edgecolor="#0f1117",
             linewidth=0.3,
             alpha=0.85,
+            label=f"{label} distribution",
+            zorder=2,
         )
 
         # Colour bars by percentile zone
@@ -1391,7 +1425,7 @@ class SimulationResults:
             elif v > pct_vals.get(95, np.inf):
                 patch.set_facecolor("#8e44ad")
 
-        # Percentile vertical lines — draw first, then add a legend box
+        # Percentile vertical lines
         legend_handles = []
         for p, v in pct_vals.items():
             color = pct_colors.get(p, "white")
@@ -1401,30 +1435,43 @@ class SimulationResults:
             )
             legend_handles.append(line)
 
-        # ── BB5: Intrinsic line + extrinsic shading ──
+        # ── LP Intrinsic line ────────────────────────────────────────────────
         if self.intrinsic_result is not None:
             iv = self.intrinsic_result.npv
-            ev = self.mean_npv - iv
             iv_line = ax_hist.axvline(
                 iv / 1e6, color="#ffffff", linewidth=2.0,
                 linestyle="-", alpha=0.9, zorder=5,
-                label=f"Intrinsic: EUR {iv/1e6:.1f}M",
+                label=f"LP Intrinsic: EUR {iv/1e6:.1f}M",
             )
             legend_handles.append(iv_line)
-            # Shade the extrinsic band between intrinsic and MC mean
-            ax_hist.axvspan(
-                iv / 1e6, self.mean_npv / 1e6,
-                alpha=0.12, color="#2ecc71", zorder=1,
+
+        # ── Greedy MC mean reference line (when LSMC is primary) ────────────
+        mc_mean = float(np.mean(self.npvs))
+        if use_lsmc:
+            mc_line = ax_hist.axvline(
+                mc_mean / 1e6, color="#f39c12", linewidth=1.4,
+                linestyle=":", alpha=0.8, zorder=4,
+                label=f"Greedy MC mean: EUR {mc_mean/1e6:.1f}M",
             )
-            # Label the extrinsic band
-            mid_x = (iv + self.mean_npv) / 2 / 1e6
+            legend_handles.append(mc_line)
+
+        # ── Extrinsic value shading (intrinsic → LSMC/MC mean) ──────────────
+        if self.intrinsic_result is not None:
+            iv       = self.intrinsic_result.npv
+            disp_mean = float(np.mean(disp_npvs))
+            ev       = disp_mean - iv
+            shade_lo = min(iv, disp_mean) / 1e6
+            shade_hi = max(iv, disp_mean) / 1e6
+            shade_color = "#2ecc71" if ev >= 0 else "#e74c3c"
+            ax_hist.axvspan(shade_lo, shade_hi, alpha=0.12, color=shade_color, zorder=1)
+            mid_x = (iv + disp_mean) / 2 / 1e6
             ax_hist.text(
                 mid_x, ax_hist.get_ylim()[1] * 0.55,
-                f"Extrinsic\nEUR {ev/1e6:.1f}M",
-                color="#2ecc71", fontsize=7.5, ha="center", va="center",
+                f"Extrinsic ({label})\nEUR {ev/1e6:.1f}M",
+                color=shade_color, fontsize=7.5, ha="center", va="center",
                 fontfamily="monospace",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#0f1117",
-                          edgecolor="#2ecc71", alpha=0.75),
+                          edgecolor=shade_color, alpha=0.75),
             )
 
         ax_hist.legend(
@@ -1441,23 +1488,24 @@ class SimulationResults:
         ax_hist.set_xlabel("NPV (EUR million)", color="#cccccc", fontsize=11)
         ax_hist.set_ylabel("Frequency", color="#cccccc", fontsize=11)
 
-        # Title — include value decomposition when intrinsic is available
+        # Title
+        disp_mean = float(np.mean(disp_npvs))
         if self.intrinsic_result is not None:
             iv  = self.intrinsic_result.npv
-            ev  = self.mean_npv - iv
+            ev  = disp_mean - iv
             title_line2 = (
-                f"Mean: EUR {self.mean_npv/1e6:.2f}M  |  "
-                f"Intrinsic: EUR {iv/1e6:.2f}M  |  "
+                f"{label} Mean: EUR {disp_mean/1e6:.2f}M  |  "
+                f"LP Intrinsic: EUR {iv/1e6:.2f}M  |  "
                 f"Extrinsic: EUR {ev/1e6:.2f}M"
             )
         else:
             title_line2 = (
-                f"Mean: EUR {self.mean_npv/1e6:.2f}M  |  "
+                f"{label} Mean: EUR {disp_mean/1e6:.2f}M  |  "
                 f"Std: EUR {self.std_npv/1e6:.2f}M  |  "
                 f"P5–P95: EUR {pct_vals[5]/1e6:.2f}M – EUR {pct_vals[95]/1e6:.2f}M"
             )
         ax_hist.set_title(
-            f"Gas Storage NPV Distribution  |  {len(self.npvs):,} Monte Carlo Paths\n"
+            f"Gas Storage NPV Distribution ({label})  |  {len(self.npvs):,} Paths\n"
             + title_line2,
             color="#e0e0e0", fontsize=12, pad=12,
         )

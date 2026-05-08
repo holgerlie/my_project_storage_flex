@@ -517,10 +517,12 @@ class LSMCOptimiser:
 
         # ── Terminal state value V_T = x_T · S_T ─────────────────────────
         cont_val = inventory[:, -1] * spots[:, -1]   # (n_fit,)
-        # Terminal constraint penalty (soft): penalise inventory outside bounds
+        # Terminal constraint penalty: penalise inventory outside bounds.
+        # Multiplier sourced from StorageParams to stay consistent with
+        # StorageDispatcher and compute_path_npv.
         viol_low  = np.maximum(0.0, st.terminal_min_inventory - inventory[:, -1])
         viol_high = np.maximum(0.0, inventory[:, -1] - st.terminal_max_inventory)
-        penalty   = (viol_low + viol_high) * spots[:, -1] * 2.0
+        penalty   = (viol_low + viol_high) * spots[:, -1] * st.terminal_penalty_multiplier
         cont_val -= penalty
 
         # ── Phase 2: backward regression with value-iteration update ─────
@@ -656,9 +658,9 @@ class LSMCOptimiser:
                 best_val = np.where(better, total, best_val)
                 best_net = np.where(better, net_vol, best_net)
 
-            # Apply best action
+            # Apply best action: trading CF + fixed cost added separately
             cf_best   = self._immediate_cf_vec(S_t, best_net)
-            npvs     += df_t * cf_best
+            npvs     += df_t * (cf_best - st.daily_fixed_cost)
             inventory = np.clip(inventory + best_net, st.min_inventory, st.max_inventory)
 
         # Terminal: liquidate remaining inventory
@@ -666,7 +668,7 @@ class LSMCOptimiser:
         S_T      = spots[:, -1]
         viol_lo  = np.maximum(0.0, st.terminal_min_inventory - inventory)
         viol_hi  = np.maximum(0.0, inventory - st.terminal_max_inventory)
-        penalty  = (viol_lo + viol_hi) * S_T * 2.0
+        penalty  = (viol_lo + viol_hi) * S_T * st.terminal_penalty_multiplier
         npvs    += df_T * (inventory * S_T - penalty)
 
         return LSMCResult(npvs=npvs, policy=policy, date_grid=self.date_grid)
@@ -722,8 +724,15 @@ class LSMCOptimiser:
 
     def _immediate_cf(self, S_t: np.ndarray, net_vol: float) -> np.ndarray:
         """
-        Immediate undiscounted cash flow (EUR) for a scalar net_vol applied
-        to all paths simultaneously.  Vectorised over paths.
+        Immediate undiscounted TRADING cash flow (EUR) for a scalar net_vol
+        applied to all paths simultaneously.  Vectorised over paths.
+
+        Daily fixed cost is intentionally excluded.  It is a constant across
+        all action candidates so it cancels in the argmax and does not affect
+        the optimal action choice.  Including it would cause it to accumulate
+        into cont_val over 365 backward steps, biasing the regression target
+        by n_steps * daily_fixed_cost per path (~EUR 182k for current config).
+        Fixed cost is added once per step in the forward pricing pass instead.
         """
         st = self.storage
         if net_vol > 0:   # injection: buy gas
@@ -733,7 +742,6 @@ class LSMCOptimiser:
             cf   = S_t * sold - st.withdrawal_cost_per_mwh * abs(net_vol)
         else:
             cf = np.zeros(len(S_t))
-        cf = cf - st.daily_fixed_cost   # fixed cost every day
         return cf
 
     def _immediate_cf_vec(
@@ -742,8 +750,11 @@ class LSMCOptimiser:
         net_vol : np.ndarray,   # (n_paths,) — per-path best action
     ) -> np.ndarray:
         """
-        Immediate undiscounted cash flow for a per-path net_vol vector.
+        Immediate undiscounted TRADING cash flow for a per-path net_vol vector.
         Used in the forward pricing pass where each path may take a different action.
+
+        Daily fixed cost is excluded here — it is added once per step directly
+        in the forward pricing loop so it does not enter the regression target.
         """
         st  = self.storage
         cf  = np.zeros(len(S_t))
@@ -759,7 +770,6 @@ class LSMCOptimiser:
             sold = np.abs(v) * st.withdrawal_efficiency
             cf[wit] = S_t[wit] * sold - st.withdrawal_cost_per_mwh * np.abs(v)
 
-        cf -= st.daily_fixed_cost
         return cf
 
     def _eval_continuation(
