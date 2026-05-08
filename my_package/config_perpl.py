@@ -180,6 +180,40 @@ HESTON = dict(
     use_sobol  = False,   # Sobol quasi-random (slower setup, better convergence)
 )
 
+# ── LSMC Parameters ──────────────────────────────────────────────────────────
+# Used when GasStorageSimulator runs the LSMC engine alongside the greedy MC.
+# All three valuations (LP intrinsic, greedy MC, LSMC) run in the same call.
+LSMC = dict(
+    # Action discretisation: candidates are {k/n_actions * max_rate} for k=1..n
+    # 5 levels = {20%, 40%, 60%, 80%, 100%} of max rate plus idle (0%).
+    # Increase to 10 for higher accuracy; runtime scales linearly.
+    n_actions   = 5,
+
+    # Regression polynomial degree for price and inventory basis terms.
+    # 3 = cubic (recommended for storage: captures asymmetric boundary effects).
+    poly_degree = 3,
+
+    # Polynomial family: "power" | "laguerre" | "chebyshev"
+    # "power" is the most interpretable; "laguerre" is the original LS choice.
+    basis_type  = "power",
+
+    # Include inventory x price (and inventory x state2) cross terms.
+    # Strongly recommended for storage: captures that high inventory is worth
+    # more when prices are high (withdrawal option is in-the-money).
+    cross_terms = True,
+
+    # Paths used for backward regression fitting pass.
+    # Remaining paths are used for forward pricing (out-of-sample).
+    # Set equal to SIMULATION["n_paths"] to use all paths for both passes.
+    # Rule of thumb: fit_paths >= 5,000 for stable regression at poly_degree=3.
+    fit_paths   = 5_000,
+
+    # Ridge regularisation coefficient (L2 penalty on regression coefficients).
+    # Prevents ill-conditioning when many basis functions are used.
+    # Typical range: 1e-6 to 1e-3. Set to 0.0 to disable.
+    regularise  = 1e-4,
+)
+
 # ── Output ───────────────────────────────────────────────────────────────────
 OUTPUT = dict(
     histogram_bins   = 80,

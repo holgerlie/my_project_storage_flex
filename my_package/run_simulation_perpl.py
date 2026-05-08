@@ -37,6 +37,11 @@ from gas_storage_mc import (
     ProcessParams,
     GasStorageSimulator,
 )
+try:
+    from lsmc import LSMCParams
+    _HAS_LSMC = True
+except ImportError:
+    _HAS_LSMC = False
 
 
 # ── Build parameter objects from config ────────────────────────────────────
@@ -93,10 +98,15 @@ def build_params():
         use_sobol   = heston["use_sobol"],
     )
 
+    # LSMCParams — optional; None if lsmc.py not available
+    lsmc_params = None
+    if _HAS_LSMC and hasattr(cfg, "LSMC"):
+        lsmc_params = LSMCParams(**cfg.LSMC)
+
     start = cfg.CALENDAR["start_date"]
     end   = cfg.CALENDAR["end_date"]
 
-    return storage, market, sim_params, opt_params, proc_params, start, end
+    return storage, market, sim_params, opt_params, proc_params, lsmc_params, start, end
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -110,7 +120,7 @@ def main():
     print("╚══════════════════════════════════════════════════════╝")
     print()
 
-    storage, market, sim_params, opt_params, proc_params, start, end = build_params()
+    storage, market, sim_params, opt_params, proc_params, lsmc_params, start, end = build_params()
 
     simulator = GasStorageSimulator(
         storage     = storage,
@@ -120,6 +130,7 @@ def main():
         proc_params = proc_params,
         start       = start,
         end         = end,
+        lsmc_params = lsmc_params,
     )
 
     t0 = time.perf_counter()

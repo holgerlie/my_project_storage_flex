@@ -32,6 +32,14 @@ import matplotlib.ticker as mtick
 from scipy.interpolate import interp1d
 from scipy.optimize import linprog
 import scipy.sparse as sp
+
+# LSMC engine — imported at module level; guarded so gas_storage_mc remains
+# usable without lsmc.py during incremental development.
+try:
+    from lsmc import LSMCParams, LSMCOptimiser, LSMCResult
+    _HAS_LSMC = True
+except ImportError:
+    _HAS_LSMC = False
 from datetime import date, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -596,13 +604,13 @@ class StorageDispatcher:
         if terminal_inventory < self.storage.terminal_min_inventory:
             terminal_penalty = (
                 (self.storage.terminal_min_inventory - terminal_inventory)
-                * prices[-1] * 3.0   # penalty = 5x market price per MWh shortfall
+                * prices[-1] * 5.0   # penalty = 5x market price per MWh shortfall
             )
         # Any gas above terminal_max is penalised too (can't store it)
         if terminal_inventory > self.storage.terminal_max_inventory:
             terminal_penalty += (
                 (terminal_inventory - self.storage.terminal_max_inventory)
-                * prices[-1] * 3.0
+                * prices[-1] * 5.0
             )
 
         return inventory, net_volume, terminal_penalty
@@ -1104,12 +1112,14 @@ class GasStorageSimulator:
         proc_params : ProcessParams,
         start       : date,
         end         : date,
+        lsmc_params : Optional["LSMCParams"] = None,
     ):
         self.storage     = storage
         self.market      = market
         self.sim         = sim
         self.opt         = opt
         self.proc_params = proc_params
+        self.lsmc_params = lsmc_params
         self.date_grid   = _build_date_grid(start, end)
 
     def run(self) -> "SimulationResults":
@@ -1162,6 +1172,25 @@ class GasStorageSimulator:
         print(f"Simulation complete. Mean NPV  : EUR {npvs.mean():,.0f}")
         print(f"Extrinsic value                : EUR {npvs.mean() - intrinsic.npv:,.0f}")
 
+        # ── 3. LSMC (optional) ──────────────────────────────────────────────────────────────
+        lsmc_result = None
+        if self.lsmc_params is not None:
+            if not _HAS_LSMC:
+                warnings.warn(
+                    "lsmc.py not found — skipping LSMC. "
+                    "Ensure lsmc.py is in the same directory.",
+                    RuntimeWarning,
+                )
+            else:
+                print("Running LSMC backward induction...")
+                lsmc_engine = LSMCOptimiser(
+                    self.storage, self.market, self.date_grid, self.lsmc_params
+                )
+                policy      = lsmc_engine.fit(bundle)
+                lsmc_result = lsmc_engine.price(bundle, policy)
+                print(f"LSMC NPV (mean) : EUR {lsmc_result.mean_npv:,.0f}")
+                print(f"  {lsmc_result.r2_summary()}")
+
         return SimulationResults(
             npvs=npvs,
             date_grid=self.date_grid,
@@ -1171,6 +1200,7 @@ class GasStorageSimulator:
             sim_params=self.sim,
             proc_params=self.proc_params,
             intrinsic_result=intrinsic,
+            lsmc_result=lsmc_result,
         )
 
     # ── Sensitivity / Greek-style analysis ──────────────────────────────────
@@ -1237,6 +1267,7 @@ class SimulationResults:
         sim_params: SimulationParams,
         proc_params: "ProcessParams",
         intrinsic_result: Optional["IntrinsicResult"] = None,
+        lsmc_result: Optional["LSMCResult"] = None,
     ):
         self.npvs = npvs
         self.date_grid = date_grid
@@ -1246,6 +1277,7 @@ class SimulationResults:
         self.sim_params = sim_params
         self.proc_params = proc_params
         self.intrinsic_result = intrinsic_result
+        self.lsmc_result      = lsmc_result
 
     @property
     def mean_npv(self) -> float:
@@ -1283,22 +1315,32 @@ class SimulationResults:
             lines.append(f"    P{p:<3d}            : EUR {self.percentile(p):>14,.0f}")
         lines.append("=" * 55)
 
-        # ── Value decomposition (only when intrinsic result is available) ──
+        # ── Value decomposition ─────────────────────────────────────────────────
+        if self.intrinsic_result is not None or self.lsmc_result is not None:
+            lines += ["", "  Value Decomposition:", "-" * 55]
+
         if self.intrinsic_result is not None:
             iv  = self.intrinsic_result.npv
             ev  = self.mean_npv - iv
             pct = (ev / iv * 100) if iv != 0 else float("nan")
             lines += [
-                "",
-                "  Value Decomposition:",
-                "-" * 55,
-                f"  Intrinsic value     : EUR {iv:>14,.0f}",
-                f"  Extrinsic value     : EUR {ev:>14,.0f}",
-                f"  Total (MC mean)     : EUR {self.mean_npv:>14,.0f}",
-                f"  Extrinsic / Intrin. : {pct:>13.1f}%",
-                "=" * 55,
+                f"  LP Intrinsic        : EUR {iv:>14,.0f}",
+                f"  Greedy MC mean      : EUR {self.mean_npv:>14,.0f}",
+                f"  Extrinsic (MC)      : EUR {ev:>14,.0f}  ({pct:.1f}%)",
             ]
 
+        if self.lsmc_result is not None:
+            lv = self.lsmc_result.mean_npv
+            lines.append(f"  LSMC mean           : EUR {lv:>14,.0f}")
+            if self.intrinsic_result is not None:
+                ev_l  = lv - self.intrinsic_result.npv
+                pct_l = (ev_l / iv * 100) if iv != 0 else float("nan")
+                lines.append(
+                    f"  Extrinsic (LSMC)    : EUR {ev_l:>14,.0f}  ({pct_l:.1f}%)"
+                )
+            lines.append(f"  {self.lsmc_result.r2_summary()}")
+
+        lines.append("=" * 55)
         return "\n".join(lines)
 
     def to_dataframe(self) -> pd.DataFrame:
